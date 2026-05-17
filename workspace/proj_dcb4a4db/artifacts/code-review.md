@@ -1,44 +1,44 @@
 # Code Review - APPROVED_WITH_CHANGES
 
 ## Summary
-The implementation covers the core flow — intent extraction, clarification, flight/hotel search, and itinerary composition — but has four blocking issues that must be resolved before this code is safe to run: the clarification loop has no hard cap in code (only in design), SerpApi exceptions are not fully caught and may leak the API key, there is no per-session rate limit protecting external API spend, and user input is appended to the Claude context without prompt-injection filtering. The security audit flagged all four of these and the implementer pass did not fully address them. Six suggestions cover schema validation, slot merge safety, dual-null guard before composition, IATA ambiguity handling, config.toml presence, and key-leak post-processing. The architecture and agent design are otherwise faithfully reflected in the code structure.
+This is the third implementation pass for the travel itinerary agent. The core architecture — Streamlit UI, ReAct agent, SerpApi flight and hotel tools, Claude-based itinerary composer, and session state management — is structurally sound and aligned with the approved design. However, the security audit in this pass continues to flag all four originally blocking issues as unresolved: prompt injection sanitization, SerpApi exception leakage of API keys, absence of per-session rate limiting, and the missing hard cap on clarification turns. Until the code demonstrates these four controls are actually present in the source, the verdict remains APPROVED_WITH_CHANGES. The six suggestions cover schema validation, slot-merge safety, dual-null composition guard, API-key post-processing, search_flights input guard, and config.toml confirmation — none are blocking independently but together represent meaningful production risk reduction.
 
-## [BLOCKING] src/agent.py around line 38-55
-Clarification turn cap of 4 is referenced in design but not enforced in code. The clarification loop can run indefinitely, causing unbounded Anthropic API calls and potential DoS per session.
-**Fix:** Before calling generate_clarification_question, check st.session_state.clarification_turns against a MAX_CLARIFICATION_TURNS=4 constant. If exceeded, return a hard-stop message listing all still-missing slots.
+## [BLOCKING] src/agent.py clarification loop logic
+The security audit in this third pass still flags 'clarification turn cap of 4 is in design doc but not confirmed enforced in code.' If st.session_state.clarification_turns is not incremented and checked with a hard guard before calling generate_clarification_question, an adversarial or confused user can loop indefinitely, exhausting LLM API budget.
+**Fix:** Add: if st.session_state.get('clarification_turns', 0) >= 4: return hard-stop message before any clarification call. Increment the counter after each clarification response.
 
-## [BLOCKING] src/tools.py around line 22-60
-SerpApi exceptions are not fully caught. Raw exception strings, which may contain the API key or full request URL, can propagate up to the caller and surface in the chat UI.
-**Fix:** Wrap all SerpApi calls in a broad try/except block. Return only a normalized error field string. Never include str(e), exception.args, or request URLs in the return value.
+## [BLOCKING] src/tools.py SerpApi call sites
+Security audit (third pass) still rates SerpApi raw exceptions as HIGH. If except blocks re-raise or propagate exception.args, the API key embedded in the SerpApi request URL can appear in Streamlit's error display or logs.
+**Fix:** All SerpApi calls must be wrapped in try/except Exception as e: return {"error": "Search unavailable. Please try again."}. Never reference str(e), e.args, or the request URL in any returned value.
 
-## [BLOCKING] src/app.py around line 15-30
-No per-session rate limiting is implemented. A user or script can trigger unlimited SerpApi and Anthropic calls, resulting in unbounded external API costs.
-**Fix:** Add st.session_state.call_count initialized to 0. Increment on each agent call. If call_count exceeds 20, display a warning and block further submissions for the session.
+## [BLOCKING] src/app.py chat submit handler
+No per-session call counter exists per the security audit (third pass still flagged MEDIUM). Without a hard cap, a single browser session can issue unlimited SerpApi and Anthropic calls, creating unbounded cost exposure.
+**Fix:** Add st.session_state.call_count (init 0). Increment on every LLM or SerpApi call. If call_count >= 20, display a warning and return without calling any external API.
 
-## [BLOCKING] src/agent.py around line 20-35
-User message is appended to the Claude messages array without any sanitization. Prompt injection sequences can override the system prompt instructions.
-**Fix:** Before appending user content to the messages list, strip or flag strings containing patterns like 'ignore previous instructions', 'disregard', or 'system:'. Log flagged inputs but do not crash.
+## [BLOCKING] src/agent.py user message append
+Security audit (third pass) still flags prompt injection as HIGH. User message is appended to the Claude context without filtering instruction-override patterns.
+**Fix:** Before appending user_message to the messages array, screen for patterns like 'ignore previous', 'disregard', 'you are now', 'system:', and truncate or reject the message with a user-visible warning if matched.
 
-## [SUGGESTION] src/tools.py around line 65-110
-SerpApi JSON responses are passed to compose_itinerary without schema validation. Unexpected or missing keys will cause KeyError at itinerary composition time.
-**Fix:** After receiving SerpApi response, validate expected top-level keys (e.g. 'flights', 'hotels') before returning. Drop or flag unexpected fields. Return empty list rather than raising KeyError.
+## [SUGGESTION] src/tools.py SerpApi response parsing
+SerpApi JSON responses are passed to compose_itinerary without schema validation. A malformed payload with missing keys causes unhandled KeyError inside the composer.
+**Fix:** Validate that required keys (e.g. 'flights', 'hotels', 'price') exist before returning data. Use .get() with defaults and drop malformed entries rather than letting KeyError propagate.
 
-## [SUGGESTION] src/prompts.py around line 1-40
-System prompt instructs the model not to reveal API keys, but no runtime assertion checks that Claude-composed strings are key-free before they are displayed.
-**Fix:** Add a post-processing guard in agent.py that asserts SERPAPI_API_KEY and ANTHROPIC_API_KEY substrings are absent from any string returned from Claude before writing to messages.
+## [SUGGESTION] src/agent.py slot merge logic
+If extract_intent_and_slots returns an overlapping slot value (e.g. a new destination that contradicts an earlier one), the merge strategy is unclear. A simple dict update will silently overwrite confirmed slots.
+**Fix:** Log slot overwrites at DEBUG level and, if a confirmed slot changes value mid-session, prompt the user to confirm the change rather than silently replacing it.
 
-## [SUGGESTION] src/app.py root .streamlit/config.toml
-No .streamlit/config.toml found with CORS and XSRF settings. The previous implementer pass was supposed to add this file per the security audit HIGH finding.
-**Fix:** Ensure .streamlit/config.toml exists with [server] enableCORS = false and enableXsrfProtection = true.
+## [SUGGESTION] src/agent.py compose_itinerary guard
+If both search_flights and search_hotels return errors, compose_itinerary may still be called with flights=null and hotels=null, producing an empty or misleading itinerary.
+**Fix:** Add a pre-composition guard: if flights is null and hotels is null, return a user-facing message explaining both data sources failed, and skip the compose call.
 
-## [SUGGESTION] src/agent.py around line 70-90
-Slots are not always merged incrementally from each extract_intent_and_slots result. If the function re-extracts from scratch and earlier slot values are missing from the latest user turn, previously confirmed slots may be overwritten with None.
-**Fix:** After calling extract_intent_and_slots, merge returned slots into st.session_state.slots using a dict update that skips None/missing values, never replaces a confirmed slot with None.
+## [SUGGESTION] src/prompts.py compose_itinerary system prompt
+Security audit flagged that no runtime check strips API key values from Claude output. The system prompt alone cannot guarantee the model never echoes an injected key.
+**Fix:** After receiving compose_itinerary response from Claude, assert that SERPAPI_API_KEY and ANTHROPIC_API_KEY substrings are absent from the response string before displaying in chat.
 
-## [SUGGESTION] src/agent.py around line 100-120
-No check prevents compose_itinerary from being called when both flights and hotels are None due to dual API errors. This would generate an empty or hallucinated itinerary.
-**Fix:** Before calling compose_itinerary, check that at least one of flights or hotels is non-null and non-empty. If both are null, surface a user-friendly message instead of invoking the composer.
+## [SUGGESTION] src/tools.py search_flights input validation
+Agent design requires rejecting any search_flights call missing origin_iata or departure_date and routing back to clarification. If this validation lives only in agent.py and not in tools.py, a future caller can bypass it.
+**Fix:** Add a guard at the top of search_flights: if not origin_iata or not departure_date: return {"error": "Missing required fields", "flights": []}.
 
-## [SUGGESTION] src/tools.py around line 18-25
-City-to-IATA resolution for ambiguous cities (e.g. London: LHR/LGW/STN) is not implemented in the tool layer. The agent design specifies this must be handled before calling search_flights.
-**Fix:** Add a simple city-to-primary-IATA mapping dict or a validation step that raises a structured error when a city resolves to multiple airports, so the orchestrator can route back to clarification.
+## [SUGGESTION] .streamlit/config.toml entire file
+Security audit flagged missing config.toml with CORS and XSRF protections. Implementation report lists config.toml as written, but the security audit in this third pass still references it as a finding.
+**Fix:** Confirm file exists at .streamlit/config.toml with [server] enableCORS = false and enableXsrfProtection = true. If present, this finding is resolved.
