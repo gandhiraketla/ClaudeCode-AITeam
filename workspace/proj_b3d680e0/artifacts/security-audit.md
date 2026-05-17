@@ -10,40 +10,40 @@
 - .env.example
 
 ## [HIGH] src/insight_generator.py: Prompt Injection
-CSV cell values inserted into Claude prompt without sanitization; attacker-controlled CSV can hijack instructions.
-**Fix:** Strip or escape sequences like 'Ignore previous instructions' and role-delimiter strings before inserting sample rows into prompt.
+CSV cell values inserted into Claude prompt without sanitization; attacker CSV can hijack instructions.
+**Fix:** Strip role-delimiter strings and 'ignore previous instructions' patterns from all cell values before prompt insertion.
 
 ## [HIGH] src/insight_generator.py: Sensitive Data Exposure
-Full API key passed as function parameter; if exception is logged with locals(), key leaks to console/log.
-**Fix:** Never pass api_key as a plain parameter. Instantiate Anthropic client inside the function reading from env directly; never include key in exception context.
+API key passed as plain function parameter; exception with locals() logs full key to console.
+**Fix:** Instantiate Anthropic client inside function reading os.environ directly; never pass api_key as parameter.
 
 ## [HIGH] src/app.py: Missing Rate Limiting
-No per-session or time-based guard on API calls beyond insight_generated flag; flag reset on each re-upload allows rapid repeated calls.
-**Fix:** Add a cooldown timestamp in session_state (e.g., last_api_call_time) and enforce minimum 10s between uploads to prevent cost DoS.
+insight_generated flag resets on each upload; rapid re-uploads allow unlimited API calls and cost abuse.
+**Fix:** Store last_api_call_time in session_state; enforce minimum 10s cooldown between uploads before invoking API.
 
 ## [MEDIUM] src/csv_parser.py: Input Validation
-CSV MIME type not verified; attacker can upload HTML/JS/executable renamed as .csv and trigger pandas parse errors or path confusion.
-**Fix:** Check first bytes for CSV-compatible content (text/plain magic) and reject files where pandas raises ParserError before processing.
+CSV MIME type not verified; executable or HTML file renamed .csv can trigger unexpected pandas behavior.
+**Fix:** Read first 512 bytes and reject if non-text content detected; catch pandas.ParserError before processing.
 
 ## [MEDIUM] src/insight_generator.py: Sensitive Data Exposure to Third Party
-Up to 20 rows of raw CSV data (potentially PII: names, emails, salaries) sent to Anthropic API with no scrubbing.
-**Fix:** Add a pre-send PII detector (regex for email, phone, SSN patterns) and mask matched values before inserting into prompt payload.
+Up to 20 raw CSV rows including potential PII (emails, names, salaries) sent to Anthropic API unmasked.
+**Fix:** Apply regex pre-scan for email, phone, SSN patterns and replace matches with [REDACTED] before prompt assembly.
 
 ## [MEDIUM] src/app.py: Security Misconfiguration
-Streamlit runs on 0.0.0.0:8501 by default; any host on the local network can access the app and upload files.
-**Fix:** Add server.address=localhost to .streamlit/config.toml to restrict binding to loopback only for local deployment.
+Streamlit binds to 0.0.0.0:8501 by default; any host on local network can access and upload files.
+**Fix:** Add server.address=localhost to .streamlit/config.toml to restrict to loopback for local deployment.
 
 ## [MEDIUM] src/insight_generator.py: Insecure Error Handling
-If API exception message contains request headers (some SDK versions do), key fragments may surface in st.error output.
-**Fix:** Catch anthropic.APIError specifically, log str(e) to server console only, and display a generic message to the UI.
+Raw SDK exception message may include request headers containing API key fragments surfaced via st.error.
+**Fix:** Catch anthropic.APIError specifically; log str(e) server-side only; display generic message to UI.
 
 ## [LOW] .env.example: Sensitive Data Exposure
-If .env (not .env.example) is accidentally committed, ANTHROPIC_API_KEY is exposed in version control.
-**Fix:** Confirm .env is in .gitignore; add a pre-commit hook or CI check that scans for ANTHROPIC_API_KEY= patterns.
+If .env is accidentally committed alongside .env.example, ANTHROPIC_API_KEY is exposed in version control.
+**Fix:** Confirm .env is in .gitignore; add pre-commit hook scanning for ANTHROPIC_API_KEY= pattern in staged files.
 
 ## Deployment Warnings
-- THREE HIGH findings present — review prompt injection and API key exposure before any non-local deployment.
-- CSV data including potential PII is transmitted to Anthropic API — confirm this is acceptable under your data policy before use with real sales data.
-- Streamlit default binding is 0.0.0.0 — restrict to localhost before deploying on any shared or networked machine.
-- Ensure .env is in .gitignore and never committed to version control.
-- Do not enable Streamlit debug mode or set STREAMLIT_LOGGER_LEVEL=debug in production as it may expose session state.
+- THREE HIGH findings unresolved — do not deploy beyond localhost until prompt injection and API key exposure are fixed.
+- CSV data including potential PII is sent to Anthropic API — confirm compliance with your data policy before use with real sales data.
+- Streamlit binds to 0.0.0.0 by default — restrict to localhost via .streamlit/config.toml before any networked deployment.
+- Ensure .env is in .gitignore and has never been staged or committed to version control.
+- Do not enable STREAMLIT_LOGGER_LEVEL=debug in any shared environment as it may expose session state and key fragments.
