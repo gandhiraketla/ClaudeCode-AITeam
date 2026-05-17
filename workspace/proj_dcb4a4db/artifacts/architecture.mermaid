@@ -1,0 +1,16 @@
+graph TD
+  A[User — Streamlit Chat Input] --> B[Agent Orchestrator]
+  B --> C[Intent & Slot Extractor]
+  C -->|Claude API| D{Slots Complete?}
+  D -->|No| E[Clarification Manager]
+  E -->|Question| A
+  D -->|Yes| F[Flight Search Tool]
+  D -->|Yes| G[Hotel Search Tool]
+  F -->|SerpApi google_flights| H[Flight Results JSON]
+  G -->|SerpApi google_hotels| I[Hotel Results JSON]
+  H --> J[Itinerary Composer]
+  I --> J
+  J -->|Claude API| K[Formatted Day-by-Day Itinerary]
+  K --> L[Streamlit Chat Display]
+  B --- M[Session State Manager]
+  M -->|st.session_state| B
