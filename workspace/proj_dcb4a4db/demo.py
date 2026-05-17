@@ -1,144 +1,110 @@
-"""Demo script for the Travel Itinerary Agent — runs without user interaction."""
+"""Demo script: runs the travel itinerary agent with sample inputs and prints output.
+
+This script bypasses Streamlit and calls the agent logic directly.
+Run: python demo.py
+"""
+from __future__ import annotations
 import os
 import sys
 import json
-from unittest.mock import patch, MagicMock
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Mock Streamlit session_state before importing agent modules
-class MockSessionState(dict):
-    def __getattr__(self, key):
+logging.basicConfig(level=logging.WARNING)
+
+# Minimal st.session_state stub so src/state.py works outside Streamlit
+class _SessionState(dict):
+    def __getattr__(self, name):
         try:
-            return self[key]
+            return self[name]
         except KeyError:
-            raise AttributeError(key)
-    def __setattr__(self, key, value):
-        self[key] = value
-    def get(self, key, default=None):
-        return super().get(key, default)
+            raise AttributeError(name)
+    def __setattr__(self, name, value):
+        self[name] = value
+    def __delattr__(self, name):
+        try:
+            del self[name]
+        except KeyError:
+            raise AttributeError(name)
 
-mock_state = MockSessionState()
+import streamlit as _st_module
+_st_module.session_state = _SessionState()
 
-mock_st = MagicMock()
-mock_st.session_state = mock_state
-
-sys.modules["streamlit"] = mock_st
+# Also patch st.rerun to no-op for demo context
+try:
+    _st_module.rerun = lambda: None
+except Exception:
+    pass
 
 from src.state import init_state
-from src.agent import run_agent
+from src.agent import process_message
 
 
-MOCK_FLIGHTS = [
-    {
-        "airline": "American Airlines",
-        "flight_number": "AA100",
-        "departure_time": "2025-06-10T08:00:00",
-        "arrival_time": "2025-06-10T21:30:00",
-        "duration_minutes": 450,
-        "price_usd": 680.0,
-        "stops": 0,
-        "booking_url": None,
-    }
-]
-
-MOCK_HOTELS = [
-    {
-        "name": "Hotel Le Marais",
-        "star_rating": 4.2,
-        "price_per_night_usd": 180.0,
-        "total_price_usd": 900.0,
-        "address": "Paris, France",
-        "amenities": ["WiFi", "Breakfast", "Concierge"],
-        "booking_url": None,
-    }
-]
-
-MOCK_INTENT_RESULT = json.dumps({
-    "intent": "full_itinerary",
-    "slots": {
-        "origin": "JFK",
-        "destination": "Paris",
-        "departure_date": "2025-06-10",
-        "return_date": "2025-06-15",
-        "check_in_date": "2025-06-10",
-        "check_out_date": "2025-06-15",
-        "num_travelers": 2,
-        "budget_usd": None,
-        "interests": ["museums", "food"]
-    },
-    "missing_required": []
-})
-
-MOCK_ITINERARY_RESULT = json.dumps({
-    "itinerary_markdown": (
-        "# Paris Trip Itinerary\n\n"
-        "**Day 1: June 10, 2025**\n\n"
-        "### Flights\n"
-        "- American Airlines AA100 | JFK → CDG\n"
-        "- Departs: 08:00 | Arrives: 21:30 | Duration: 7h 30m\n"
-        "- Price: $680/person\n\n"
-        "### Accommodation\n"
-        "- Hotel Le Marais (4.2★) — $180/night\n"
-        "- Amenities: WiFi, Breakfast, Concierge\n\n"
-        "**Day 2: June 11, 2025**\n\n"
-        "### Activities\n"
-        "- Morning: Louvre Museum\n"
-        "- Afternoon: Seine River Walk\n"
-        "- Evening: Dinner in Le Marais district\n\n"
-        "**Day 3-5: June 12-14, 2025**\n\n"
-        "### Activities\n"
-        "- Eiffel Tower, Musée d'Orsay, Montmartre\n\n"
-        "**Day 6: June 15, 2025** — Departure"
-    ),
-    "days": 6,
-    "warnings": []
-})
+def run_demo_turn(label: str, message: str) -> str:
+    print(f"\n{'='*60}")
+    print(f"USER [{label}]: {message}")
+    print("-" * 60)
+    reply = process_message(message)
+    print(f"AGENT:\n{reply}")
+    return reply
 
 
-def run_demo():
-    print("=" * 60)
+def main() -> None:
     print("Travel Itinerary Agent — Demo")
-    print("=" * 60)
+    print("Checking environment variables...")
 
-    sample_input = "Plan my trip to Paris for 5 days in June for 2 people, we love museums and food"
-    print(f"\nUser: {sample_input}\n")
+    missing_keys = []
+    for key in ("ANTHROPIC_API_KEY", "SERPAPI_API_KEY"):
+        if not os.environ.get(key):
+            missing_keys.append(key)
 
-    call_responses = [MOCK_INTENT_RESULT, MOCK_ITINERARY_RESULT]
-    call_index = {"i": 0}
+    if missing_keys:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing_keys)}")
+        print("Copy .env.example to .env and fill in your API keys.")
+        sys.exit(1)
 
-    def mock_call_claude(system, user, max_tokens=1024):
-        idx = call_index["i"]
-        call_index["i"] += 1
-        if idx < len(call_responses):
-            return call_responses[idx]
-        return json.dumps({"intent": "unclear", "slots": {}, "missing_required": []})
+    print("Environment OK.\n")
 
-    mock_flights_return = {
-        "flights": MOCK_FLIGHTS,
-        "search_timestamp": "2025-06-01T12:00:00",
-        "error": None
-    }
-    mock_hotels_return = {
-        "hotels": MOCK_HOTELS,
-        "search_timestamp": "2025-06-01T12:00:00",
-        "error": None
-    }
+    # Initialize session state
+    init_state()
 
-    with patch("src.agent._call_claude", side_effect=mock_call_claude), \
-         patch("src.agent.search_flights", return_value=mock_flights_return), \
-         patch("src.agent.search_hotels", return_value=mock_hotels_return):
+    # Demo scenario 1: open-ended Paris trip request
+    print("\n--- Scenario 1: Full itinerary request ---")
+    run_demo_turn(
+        "open-ended trip",
+        "Plan my trip to Paris for 5 days in June 2025 for 2 people. I love art and food."
+    )
 
-        init_state()
-        response = run_agent(sample_input)
+    # Reset state for scenario 2
+    import streamlit as st
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    init_state()
 
-    print("Agent Response:")
-    print("-" * 60)
-    print(response)
-    print("-" * 60)
-    print("\nDemo complete.")
+    # Demo scenario 2: specific flight query
+    print("\n--- Scenario 2: Flights-only request ---")
+    run_demo_turn(
+        "flights only",
+        "Show me flights from New York to Dallas on 2025-07-15"
+    )
+
+    # Reset state for scenario 3
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    init_state()
+
+    # Demo scenario 3: incomplete input triggers clarification
+    print("\n--- Scenario 3: Incomplete input — clarification expected ---")
+    run_demo_turn(
+        "incomplete",
+        "I want to visit Tokyo"
+    )
+
+    print("\n" + "="*60)
+    print("Demo complete.")
 
 
 if __name__ == "__main__":
-    run_demo()
+    main()
