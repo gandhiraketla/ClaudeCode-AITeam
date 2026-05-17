@@ -205,61 +205,7 @@ Each persona is a markdown skill file stored in `.claude/skills/`. It defines th
 
 ### System Diagram
 
-```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                              CLAUDEFORGE SYSTEM                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-  ┌──────────────┐     ngrok tunnel      ┌──────────────────────────────────┐
-  │              │  POST /slack/events   │                                  │
-  │    Slack     │ ───────────────────► │     FastAPI Orchestrator          │
-  │   Channel    │ ◄─────────────────── │     localhost:8000                │
-  │              │   persona messages   │                                  │
-  └──────────────┘                      └───────────────┬──────────────────┘
-                                                        │
-                              ┌─────────────────────────┼──────────────────────┐
-                              │                         │                      │
-                    ┌─────────▼──────────┐   ┌──────────▼────────┐   ┌────────▼───────┐
-                    │   State Machine    │   │   Skill Runner    │   │   Workspace    │
-                    │   (SQLite)         │   │   (Anthropic SDK) │   │   Manager      │
-                    │                   │   │                   │   │                │
-                    │  tracks:          │   │  system prompt:   │   │  creates:      │
-                    │  - project state  │   │  <persona>.md     │   │  artifacts/    │
-                    │  - artifacts      │   │                   │   │  src/          │
-                    │  - messages       │   │  user message:    │   │  evals/        │
-                    │  - approvals      │   │  context JSON     │   │  tests/        │
-                    └────────────────────┘   └───────────────────┘   └────────────────┘
-                                                        │
-                              ┌─────────────────────────▼──────────────────────┐
-                              │                  8 AI PERSONAS                  │
-                              │                                                  │
-                              │  .claude/skills/ba.md                           │
-                              │  .claude/skills/architect.md                    │
-                              │  .claude/skills/agent-implementer.md            │
-                              │  .claude/skills/implementer.md                  │
-                              │  .claude/skills/reviewer.md                     │
-                              │  .claude/skills/security.md                     │
-                              │  .claude/skills/tester.md                       │
-                              │  .claude/skills/devops.md                       │
-                              └──────────────────────────────────────────────── ┘
-                                                        │
-                              ┌─────────────────────────▼──────────────────────┐
-                              │               Git (commit + push)               │
-                              │                                                  │
-                              │  feat(ba):                requirements.md       │
-                              │  feat(architect):         architecture.md       │
-                              │  feat(agent-implementer): agent-design.md      │
-                              │  feat(implementer):       src/ code            │
-                              │  feat(reviewer):          code-review.md       │
-                              │  feat(security):          security-audit.md    │
-                              │  feat(tester):            test-plan.md         │
-                              └─────────────────────────────────────────────── ┘
-```
-
-### Excalidraw Diagram
-
-An interactive Excalidraw diagram is available at [`architecture.excalidraw`](architecture.excalidraw).
-Open it at [excalidraw.com](https://excalidraw.com) — drag and drop the file.
+![ClaudeForge Architecture](docs/architecture.png)
 
 ### Pipeline State Machine
 
