@@ -1,160 +1,344 @@
 # ClaudeForge
 
 > **An AI Engineering Team built with Claude.**
-> Turn a single Slack message into a fully built, tested, and deployed application.
+> Describe what you want to build in Slack. Eight specialized AI personas collaborate to design, build, test, and deploy it — automatically.
 
 ---
 
-## Overview
+## 1. Introduction
 
-ClaudeForge is a local-first AI engineering organization powered by Claude. You describe what you want to build in Slack. Eight specialized AI personas collaborate — asking questions, designing systems, writing code, reviewing it, auditing security, running evaluations, and deploying the result.
+ClaudeForge is a local-first AI engineering organization powered by Claude. It transforms a single Slack message into a fully built, reviewed, secured, tested, and deployed application.
 
-Every decision is committed to Git. Every stage is visible in your terminal. The final app is live on localhost.
+### The Problem It Solves
+
+Building software requires coordinated expertise — requirements gathering, system design, implementation, code review, security auditing, testing, and deployment. Traditionally these are separate people, separate tools, separate conversations. ClaudeForge unifies them into a single collaborative workflow driven entirely from Slack.
+
+### How It Works
+
+```
+You type one message in Slack
+         │
+         ▼
+Business Analyst asks clarifying questions
+         │  (you answer in the thread)
+         ▼
+Requirements captured and approved
+         │
+         ▼
+Architect designs the system, identifies required API keys
+         │  (you approve the architecture)
+         ▼
+Agent Implementer designs the reasoning layer
+         │  (you approve the agent design)
+         ▼
+Implementer writes all code files
+         │
+         ▼
+Code Reviewer audits quality
+         │
+         ▼
+Security Reviewer audits for vulnerabilities
+         │
+         ▼
+Tester writes and runs LangSmith evaluations
+         │
+         ▼
+DevOps deploys locally and posts the live URL
+         │
+         ▼
+App is running. Git history shows every decision made.
+```
+
+### What Makes It Different
+
+- **Not a chatbot.** A governed workflow with specialized roles, human approval gates, and automatic progression.
+- **Every artifact is committed to Git.** Requirements, architecture, agent design, code review, security audit, test plan — all versioned.
+- **The generated app runs.** DevOps installs dependencies, starts the server, health-checks it, and posts the URL to Slack.
+- **Recoverable.** If any stage fails, reply `resume` in the thread. Reply `changes` + feedback at any approval gate to revise.
 
 ---
 
-## System Architecture
+## 2. Claude Skills and AI Personas
 
-```
- ╔══════════════════════════════════════════════════════════════════════╗
- ║                          CLAUDEFORGE                                 ║
- ╚══════════════════════════════════════════════════════════════════════╝
-
-  ┌─────────────────┐        HTTP POST         ┌──────────────────────┐
-  │                 │  ─────────────────────>  │                      │
-  │   Slack         │    /slack/events          │   FastAPI            │
-  │   #channel      │  <─────────────────────  │   Orchestrator       │
-  │                 │    persona messages       │   localhost:8000     │
-  └─────────────────┘                          └──────────┬───────────┘
-           ^                                              │
-           │                                             │
-    ngrok tunnel                                         │
-    (public HTTPS)                              ┌────────▼────────────┐
-                                                │   State Machine     │
-                                                │   SQLite            │
-                                                │                     │
-                                                │  DISCOVERY          │
-                                                │    -> ARCH          │
-                                                │    -> AGENT_DESIGN  │
-                                                │    -> IMPLEMENT     │
-                                                │    -> REVIEW        │
-                                                │    -> SECURITY      │
-                                                │    -> TESTING       │
-                                                │    -> DEVOPS        │
-                                                │    -> COMPLETE      │
-                                                └────────┬────────────┘
-                                                         │
-                                            ┌────────────▼─────────────┐
-                                            │      Skill Runner        │
-                                            │      Anthropic SDK       │
-                                            │                          │
-                                            │  system: <persona>.md    │
-                                            │  user:   context JSON    │
-                                            │  output: structured JSON │
-                                            └────────────┬─────────────┘
-                                                         │
-                              ┌──────────────────────────▼──────────────────────────┐
-                              │                  8 AI Personas                       │
-                              │                                                       │
-                              │  [BA] -> [Architect] -> [Agent Impl] -> [Implementer]│
-                              │       -> [Reviewer]  -> [Security]  -> [Tester]      │
-                              │       -> [DevOps]                                     │
-                              └──────────────────────────┬──────────────────────────┘
-                                                         │
-                              ┌──────────────────────────▼──────────────────────────┐
-                              │                Workspace / Git                        │
-                              │                                                       │
-                              │  workspace/{project}/                                 │
-                              │    artifacts/   <- design docs (.md)                 │
-                              │    src/         <- generated application code        │
-                              │    evals/       <- LangSmith eval scripts            │
-                              │                                                       │
-                              │  git commit + push after every stage                 │
-                              └─────────────────────────────────────────────────────┘
-```
+Each persona is a markdown skill file stored in `.claude/skills/`. It defines the cognitive mode, output contract, and engineering rules for that role. Claude reads the skill as its system prompt and receives the full project context as structured JSON.
 
 ---
 
-## The 8 AI Personas
+### Business Analyst — `ba.md`
 
-Each persona is a markdown skill file in `.claude/skills/`. It defines the cognitive mode, input/output contract, and engineering rules for that role.
+**Cognitive mode:** Discovery. Transforms vague intent into precise requirements.
 
-```
- ┌──────────────────────────────────────────────────────────────────────────┐
- │                        PIPELINE FLOW                                      │
- │                                                                            │
- │   User types @Business-Analyst <request> in Slack                         │
- │                                                                            │
- │   ┌─────────────────┐                                                      │
- │   │  Business        │  Discovery loop — asks focused questions            │
- │   │  Analyst         │  until requirements are complete                    │
- │   │  [USER APPROVAL] │  Outputs: requirements.md                           │
- │   └────────┬─────────┘                                                     │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  Solution         │  Technical discovery — asks about stack,           │
- │   │  Architect        │  UI preference, API keys needed                    │
- │   │  [USER APPROVAL] │  Outputs: architecture.md + Mermaid diagram        │
- │   └────────┬─────────┘                                                     │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  Agent            │  Designs reasoning strategy, tools,                │
- │   │  Implementer      │  memory, guardrails                                │
- │   │  [USER APPROVAL] │  Outputs: agent-design.md                          │
- │   └────────┬─────────┘                                                     │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  Implementer      │  Generates code file by file in dependency        │
- │   │  [AUTO]          │  order using prior artifacts as context             │
- │   └────────┬─────────┘  Outputs: src/, requirements.txt, demo.py          │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  Code Reviewer    │  Audits quality, architecture alignment,           │
- │   │  [AUTO]          │  error handling, completeness                       │
- │   └────────┬─────────┘  Outputs: code-review.md                           │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  Security         │  Audits actual generated code — OWASP Top 10,     │
- │   │  Reviewer [AUTO] │  prompt injection, hardcoded secrets                │
- │   └────────┬─────────┘  Outputs: security-audit.md                        │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  Tester           │  Writes + executes LangSmith evaluations           │
- │   │  [AUTO]          │  against acceptance criteria                        │
- │   └────────┬─────────┘  Outputs: evals/run_evals.py, test-plan.md         │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  DevOps           │  Installs deps, starts the app,                    │
- │   │  [AUTO]          │  health-checks, posts live URL to Slack             │
- │   └────────┬─────────┘                                                     │
- │            │                                                               │
- │   ┌────────▼─────────┐                                                     │
- │   │  COMPLETE         │  Git log posted to Slack. App is live.             │
- │   └──────────────────┘                                                     │
- └──────────────────────────────────────────────────────────────────────────┘
-```
+**What it does:**
+- Runs a dynamic multi-turn discovery loop — asks focused questions one at a time
+- Tracks what it knows vs. what is still missing
+- Produces a complete requirements document with functional requirements, acceptance criteria, and explicit out-of-scope list
+- Asks for user approval before handing off
+
+**Approval gate:** Yes — user must reply `approved` before pipeline continues
+
+**Output artifact:** `artifacts/requirements.md`
 
 ---
 
-## Project Workspace
+### Solution Architect — `architect.md`
 
-Every project gets an isolated workspace:
+**Cognitive mode:** Technical discovery + system design.
+
+**What it does:**
+- Asks up to 5 focused technical questions — UI preference, stack constraints, API keys needed, deployment environment
+- Detects which external API keys the design requires and posts a checklist
+- Produces full architecture document: components, tech stack with rationale, data flow, deployment instructions
+- Always generates a Mermaid diagram of the system
+- If requirements specify a UI (Streamlit, React, HTML), it designs that UI
+
+**Approval gate:** Yes — user must reply `approved` before pipeline continues
+
+**Output artifact:** `artifacts/architecture.md`, `artifacts/architecture.mermaid`
+
+---
+
+### Agent Implementer — `agent-implementer.md`
+
+**Cognitive mode:** Reasoning design. Designs how the AI inside the app thinks.
+
+**What it does:**
+- Selects and justifies a reasoning strategy (ReAct, Plan-then-Execute, Chain-of-Thought, etc.)
+- Defines every tool the agent has access to with precise input/output contracts
+- Designs memory and state strategy
+- Defines failure modes and guardrails
+- Does not write code — designs the reasoning layer the Implementer will build
+
+**Approval gate:** Yes — user must reply `approved` before pipeline continues
+
+**Output artifact:** `artifacts/agent-design.md`
+
+---
+
+### Implementer — `implementer.md`
+
+**Cognitive mode:** Execution. Turns approved design into working code.
+
+**What it does:**
+- First call determines the complete file list from the architecture in dependency order
+- Generates each file individually, passing already-written files as context so imports stay consistent
+- Follows architecture exactly — builds the UI framework the Architect specified
+- Writes `demo.py` — a standalone script that runs the app with a sample input
+- Never introduces frameworks or patterns not approved by the Architect
+
+**Approval gate:** None — automatic
+
+**Output artifact:** `src/`, `requirements.txt`, `.env.example`, `demo.py`
+
+---
+
+### Code Reviewer — `reviewer.md`
+
+**Cognitive mode:** Quality audit.
+
+**What it does:**
+- Reads every generated source file
+- Checks alignment with approved architecture and requirements
+- Flags correctness issues, missing error handling, incomplete implementations
+- Issues verdict: `APPROVED`, `APPROVED_WITH_CHANGES`, or `REJECTED`
+- `REJECTED` loops back to Implementer automatically
+
+**Approval gate:** None — automatic
+
+**Output artifact:** `artifacts/code-review.md`
+
+---
+
+### Security Reviewer — `security.md`
+
+**Cognitive mode:** Adversarial. Audits actual generated code — not design documents.
+
+**What it does:**
+- Reads source files from `src/`
+- Checks OWASP Top 10: injection, auth issues, data exposure, misconfigurations
+- Checks agent-specific risks: prompt injection, tool misuse, runaway loops, key leakage
+- All findings are advisory after implementation — pipeline always continues
+- Flags HIGH severity findings prominently for DevOps awareness before deployment
+
+**Approval gate:** None — automatic
+
+**Output artifact:** `artifacts/security-audit.md`
+
+---
+
+### Tester — `tester.md`
+
+**Cognitive mode:** Adversarial functional testing using LangSmith.
+
+**What it does:**
+- Derives test cases from the requirements acceptance criteria
+- Writes `evals/run_evals.py` — a LangSmith evaluation script
+- Executes the eval script and posts results to Slack
+- Tests happy path, edge cases, failure cases, and adversarial inputs
+- Issues verdict: `PASS`, `PASS_WITH_WARNINGS`, or `FAIL`
+- `FAIL` loops back to Implementer automatically
+
+**Approval gate:** None — automatic
+
+**Output artifact:** `artifacts/test-plan.md`, `evals/run_evals.py`
+
+---
+
+### DevOps — `devops.md`
+
+**Cognitive mode:** Deployment. Gets the app running locally.
+
+**What it does:**
+- Reads architecture and implementation to determine the exact start command
+- Installs dependencies in the workspace
+- Starts the application process
+- Health-checks the running service
+- Posts the live URL to Slack
+- Posts the complete git history to Slack
+
+**Approval gate:** None — automatic
+
+**Output:** Live app URL posted to Slack
+
+---
+
+## 3. Architecture
+
+### System Diagram
+
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              CLAUDEFORGE SYSTEM                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+  ┌──────────────┐     ngrok tunnel      ┌──────────────────────────────────┐
+  │              │  POST /slack/events   │                                  │
+  │    Slack     │ ───────────────────► │     FastAPI Orchestrator          │
+  │   Channel    │ ◄─────────────────── │     localhost:8000                │
+  │              │   persona messages   │                                  │
+  └──────────────┘                      └───────────────┬──────────────────┘
+                                                        │
+                              ┌─────────────────────────┼──────────────────────┐
+                              │                         │                      │
+                    ┌─────────▼──────────┐   ┌──────────▼────────┐   ┌────────▼───────┐
+                    │   State Machine    │   │   Skill Runner    │   │   Workspace    │
+                    │   (SQLite)         │   │   (Anthropic SDK) │   │   Manager      │
+                    │                   │   │                   │   │                │
+                    │  tracks:          │   │  system prompt:   │   │  creates:      │
+                    │  - project state  │   │  <persona>.md     │   │  artifacts/    │
+                    │  - artifacts      │   │                   │   │  src/          │
+                    │  - messages       │   │  user message:    │   │  evals/        │
+                    │  - approvals      │   │  context JSON     │   │  tests/        │
+                    └────────────────────┘   └───────────────────┘   └────────────────┘
+                                                        │
+                              ┌─────────────────────────▼──────────────────────┐
+                              │                  8 AI PERSONAS                  │
+                              │                                                  │
+                              │  .claude/skills/ba.md                           │
+                              │  .claude/skills/architect.md                    │
+                              │  .claude/skills/agent-implementer.md            │
+                              │  .claude/skills/implementer.md                  │
+                              │  .claude/skills/reviewer.md                     │
+                              │  .claude/skills/security.md                     │
+                              │  .claude/skills/tester.md                       │
+                              │  .claude/skills/devops.md                       │
+                              └──────────────────────────────────────────────── ┘
+                                                        │
+                              ┌─────────────────────────▼──────────────────────┐
+                              │               Git (commit + push)               │
+                              │                                                  │
+                              │  feat(ba):                requirements.md       │
+                              │  feat(architect):         architecture.md       │
+                              │  feat(agent-implementer): agent-design.md      │
+                              │  feat(implementer):       src/ code            │
+                              │  feat(reviewer):          code-review.md       │
+                              │  feat(security):          security-audit.md    │
+                              │  feat(tester):            test-plan.md         │
+                              └─────────────────────────────────────────────── ┘
+```
+
+### Excalidraw Diagram
+
+An interactive Excalidraw diagram is available at [`architecture.excalidraw`](architecture.excalidraw).
+Open it at [excalidraw.com](https://excalidraw.com) — drag and drop the file.
+
+### Pipeline State Machine
+
+```
+  IDLE
+   │  @Business-Analyst <request>
+   ▼
+  DISCOVERY_ACTIVE ──────────────────────── BA asks questions
+  DISCOVERY_WAITING ─────────────────────── waiting for user reply
+  DISCOVERY_APPROVAL_PENDING ─────────────── awaiting: approved / changes
+   │
+   ▼
+  ARCH_DISCOVERY_ACTIVE ──────────────────── Architect asks technical questions
+  ARCH_WAITING_FOR_KEYS ──────────────────── Architect lists required API keys
+  ARCHITECTURE_ACTIVE ────────────────────── Architect designs system
+  ARCHITECTURE_APPROVAL_PENDING ──────────── awaiting: approved / changes
+   │
+   ▼
+  AGENT_DESIGN_ACTIVE ────────────────────── Agent Implementer designs reasoning
+  AGENT_DESIGN_APPROVAL_PENDING ──────────── awaiting: approved / changes
+   │
+   ▼
+  IMPLEMENTATION_ACTIVE ──────────────────── Implementer writes code       [AUTO]
+   │
+   ▼
+  REVIEW_ACTIVE ──────────────────────────── Code Reviewer audits          [AUTO]
+   │
+   ▼
+  SECURITY_ACTIVE ────────────────────────── Security Reviewer audits code [AUTO]
+   │
+   ▼
+  TESTING_ACTIVE ─────────────────────────── Tester runs evals             [AUTO]
+   │
+   ▼
+  DEVOPS_ACTIVE ──────────────────────────── DevOps deploys + posts URL    [AUTO]
+   │
+   ▼
+  COMPLETE
+
+
+  [USER APPROVAL]  =  requires "approved" in Slack thread
+  [AUTO]           =  runs automatically, no user input needed
+  Any stage        →  reply "resume" to retry after failure
+  Any approval     →  reply "changes" + feedback to revise
+```
+
+### Orchestrator File Map
+
+```
+ orchestrator/
+ ├── main.py              FastAPI app · Slack event handler · full pipeline wiring
+ ├── state.py             SQLite state machine · project lifecycle · artifact storage
+ ├── skill_runner.py      Loads skill prompt · invokes Claude · parses JSON response
+ ├── context_builder.py   Assembles context JSON for each skill invocation
+ ├── router.py            Parses @mentions · detects approvals · alias mapping
+ ├── approval_handler.py  Routes approved / changes / resume responses
+ ├── slack_client.py      Persona-aware posting · file uploads · reactions
+ ├── workspace_manager.py Creates project directory tree · writes artifacts to disk
+ ├── git_helper.py        Commits and pushes after each stage
+ └── console.py           Color-coded terminal output for demo visibility
+```
+
+### Workspace Layout
 
 ```
  workspace/
  └── {project-name}/
      ├── artifacts/
-     │   ├── requirements.md          (Business Analyst)
-     │   ├── architecture.md          (Solution Architect)
-     │   ├── architecture.mermaid     (Solution Architect)
-     │   ├── agent-design.md          (Agent Implementer)
-     │   ├── implementation-report.md (Implementer)
-     │   ├── code-review.md           (Code Reviewer)
-     │   ├── security-audit.md        (Security Reviewer)
-     │   └── test-plan.md             (Tester)
-     ├── src/                         (generated application code)
+     │   ├── requirements.md           ← Business Analyst
+     │   ├── architecture.md           ← Solution Architect
+     │   ├── architecture.mermaid      ← Solution Architect
+     │   ├── agent-design.md           ← Agent Implementer
+     │   ├── implementation-report.md  ← Implementer
+     │   ├── code-review.md            ← Code Reviewer
+     │   ├── security-audit.md         ← Security Reviewer
+     │   └── test-plan.md              ← Tester
+     ├── src/                          ← generated application code
      ├── evals/
-     │   └── run_evals.py             (LangSmith evaluations)
+     │   └── run_evals.py              ← LangSmith evaluations
      ├── tests/
      ├── requirements.txt
      ├── .env.example
@@ -163,50 +347,19 @@ Every project gets an isolated workspace:
 
 ---
 
-## Git History Per Project
-
-Every stage commits and pushes. Your repo tells the full engineering story:
-
-```
-feat(ba):                requirements document
-feat(architect):         architecture design
-feat(agent-implementer): agent reasoning design
-feat(implementer):       initial implementation - N files
-feat(reviewer):          code review - APPROVED
-feat(security):          security audit - N findings
-feat(tester):            evals and test plan - PASS
-```
-
----
-
-## Orchestrator Components
-
-```
- orchestrator/
- ├── main.py              FastAPI app + Slack event handler + full pipeline
- ├── state.py             SQLite state machine — project lifecycle + artifacts
- ├── skill_runner.py      Invokes Claude with skill prompt + context JSON
- ├── context_builder.py   Assembles context passed to each skill invocation
- ├── router.py            Parses @mentions, detects approvals
- ├── approval_handler.py  Routes approved / changes responses
- ├── slack_client.py      Persona-aware Slack posting (username + emoji per role)
- ├── workspace_manager.py Creates and manages project workspace on disk
- ├── git_helper.py        Commits and pushes after each stage
- └── console.py           Color-coded terminal output
-```
-
----
-
-## Local Setup
+## 4. Setup and Install
 
 ### Prerequisites
 
-- Python 3.12+
-- [ngrok](https://ngrok.com) account and CLI
-- Slack workspace with admin access
-- Anthropic API key
+| Requirement | Notes |
+|-------------|-------|
+| Python 3.12+ | |
+| [ngrok](https://ngrok.com) | Free account sufficient |
+| Slack workspace | Admin access to create apps |
+| Anthropic API key | [console.anthropic.com](https://console.anthropic.com) |
+| LangSmith API key | Optional — for eval tracing |
 
-### 1. Install
+### Step 1 — Clone and Install
 
 ```powershell
 git clone https://github.com/gandhiraketla/ClaudeCode-AITeam.git
@@ -214,7 +367,9 @@ cd ClaudeCode-AITeam
 pip install -r requirements.txt
 ```
 
-### 2. Configure `.env`
+### Step 2 — Configure Environment
+
+Create a `.env` file in the project root:
 
 ```env
 SLACK_BOT_TOKEN=xoxb-...
@@ -222,77 +377,88 @@ SLACK_SIGNING_SECRET=...
 SLACK_CHANNEL_ID=C...
 ANTHROPIC_API_KEY=sk-ant-...
 WORKSPACE_BASE_PATH=C:/ClaudeCode-AITeam/workspace
-LANGSMITH_API_KEY=...        # optional — for eval tracing
+LANGSMITH_API_KEY=...         # optional
+LANGCHAIN_TRACING_V2=true     # optional
+LANGCHAIN_PROJECT=claudeforge # optional
 ```
 
-### 3. Create Slack App
+### Step 3 — Create Slack App
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → Create New App
-2. **OAuth & Permissions** → Bot Token Scopes:
-   `chat:write` `chat:write.customize` `files:write` `reactions:write` `channels:history` `channels:read`
-3. **Event Subscriptions** → Subscribe to bot events:
-   `message.channels` `app_mention`
-4. Install app to workspace → copy Bot Token
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → From Scratch
+2. **Features → OAuth & Permissions → Bot Token Scopes** — add:
+   ```
+   chat:write
+   chat:write.customize
+   files:write
+   reactions:write
+   channels:history
+   channels:read
+   ```
+3. **Features → Event Subscriptions** → Enable Events → Subscribe to bot events:
+   ```
+   message.channels
+   app_mention
+   ```
+4. **Settings → Install App** → Install to Workspace → copy the `xoxb-` Bot Token
+5. **Basic Information → App Credentials** → copy the Signing Secret
 
-### 4. Start
+### Step 4 — Start ngrok
 
-**Terminal 1:**
-```powershell
-python .\run.py
-```
-
-**Terminal 2:**
 ```powershell
 ngrok http 8000
 ```
 
-Paste the ngrok URL into **Slack App → Event Subscriptions → Request URL**:
+Copy the forwarding URL — e.g. `https://abc123.ngrok-free.app`
+
+### Step 5 — Configure Slack Event URL
+
+In your Slack app → **Features → Event Subscriptions → Request URL**:
+
 ```
-https://xxx.ngrok-free.app/slack/events
+https://abc123.ngrok-free.app/slack/events
 ```
 
-**Invite bot to channel:**
+Slack will verify it immediately. You should see a green **Verified** checkmark.
+
+### Step 6 — Start ClaudeForge
+
+```powershell
+python .\run.py
+```
+
+Expected output:
+```
+============================================================
+  ClaudeForge - AI Engineering Team
+  HTTP Mode | Ready for messages
+============================================================
+```
+
+### Step 7 — Invite Bot to Channel
+
+In your Slack channel:
 ```
 /invite @claudeforge
 ```
 
----
-
-## Usage
+### Step 8 — Build Something
 
 Post in Slack:
-
 ```
 @Business-Analyst I want to build a CSV Insights Generator web app
 ```
 
-At approval gates reply `approved` to proceed or `changes` + feedback to revise.
-If a stage fails, reply `resume` to retry it.
-
----
-
-## Key Design Decisions
-
-**HTTP mode over Socket Mode**
-Socket Mode load-balances events across all open connections. Ghost connections from restarts cause events to be lost. HTTP mode via ngrok is deterministic — every event hits one endpoint.
-
-**One file per Implementer invocation**
-A single call for all files overflows the context window and truncates JSON. One file per call keeps responses small, passes already-written files as context so imports stay consistent, and makes individual failures recoverable.
-
-**SQLite over a heavier database**
-Local-first demo system. SQLite with WAL mode handles the sequential workload with zero external dependencies.
-
-**Commit after every stage**
-The git history becomes a complete audit trail. You can show `git log` and walk through every decision the AI team made — from requirements to deployment.
+Reply `approved` at each approval gate. Reply `changes` + feedback to revise. Reply `resume` if anything fails.
 
 ---
 
 ## Troubleshooting
 
-| Issue | Fix |
-|-------|-----|
-| Pipeline stuck | Reply `resume` in the Slack thread |
-| ngrok URL changed | Update Request URL in Slack Event Subscriptions |
-| Missing API keys | Add to `.env`, reply `ready` in thread |
-| Port already in use | `Get-Process python \| Stop-Process -Force` |
-| No events from Slack | Run `/invite @claudeforge`, verify ngrok forwards to port 8000 |
+| Symptom | Fix |
+|---------|-----|
+| Pipeline stuck in a state | Reply `resume` in the Slack thread |
+| ngrok URL changed on restart | Update Request URL in Slack Event Subscriptions |
+| "Missing API keys" warning | Add keys to `.env`, reply `ready` in thread — pipeline continues regardless |
+| Port 8000 already in use | `Get-Process python \| Stop-Process -Force` |
+| No events arriving from Slack | Confirm `/invite @claudeforge` in channel · verify ngrok forwards to port 8000 · check Event Subscriptions shows `message.channels` |
+| Bot posts but nothing happens | Check Terminal 1 for error output · reply `resume` in thread |
