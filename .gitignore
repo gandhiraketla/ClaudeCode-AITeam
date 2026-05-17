@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+db/claudeforge.db
+debug_slack.py
+debug_ws.py
+.claude/settings.local.json
