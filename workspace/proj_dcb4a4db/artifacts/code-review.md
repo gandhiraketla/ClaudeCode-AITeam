@@ -1,44 +1,44 @@
 # Code Review - APPROVED_WITH_CHANGES
 
 ## Summary
-This is the third implementation pass for the travel itinerary agent. The core architecture — Streamlit UI, ReAct agent, SerpApi flight and hotel tools, Claude-based itinerary composer, and session state management — is structurally sound and aligned with the approved design. However, the security audit in this pass continues to flag all four originally blocking issues as unresolved: prompt injection sanitization, SerpApi exception leakage of API keys, absence of per-session rate limiting, and the missing hard cap on clarification turns. Until the code demonstrates these four controls are actually present in the source, the verdict remains APPROVED_WITH_CHANGES. The six suggestions cover schema validation, slot-merge safety, dual-null composition guard, API-key post-processing, search_flights input guard, and config.toml confirmation — none are blocking independently but together represent meaningful production risk reduction.
+This is the fourth implementation pass for the travel itinerary agent. The overall architecture — Streamlit UI, ReAct agent loop, SerpApi flight and hotel tools, Claude-based itinerary composer, and session state management — is correctly structured and aligned with the approved design. However, the same four blocking issues flagged in the two previous code reviews remain unresolved in the source: (1) user input is appended to the Claude context without prompt-injection sanitization, (2) SerpApi exceptions may leak the API key through str(e) or exception.args, (3) there is no per-session API call counter capping spend, and (4) the clarification loop has no hard turn-cap enforced in code despite being specified in the agent design. These are not architectural changes — they are missing lines of defensive code that must be added before this agent is safe to run. Six suggestions cover slot-merge safety, dual-null composition guard, schema validation on SerpApi responses, API key post-processing in Claude output, IATA input validation, and config.toml content confirmation. The verdict is APPROVED_WITH_CHANGES pending resolution of all four blocking items.
 
-## [BLOCKING] src/agent.py clarification loop logic
-The security audit in this third pass still flags 'clarification turn cap of 4 is in design doc but not confirmed enforced in code.' If st.session_state.clarification_turns is not incremented and checked with a hard guard before calling generate_clarification_question, an adversarial or confused user can loop indefinitely, exhausting LLM API budget.
-**Fix:** Add: if st.session_state.get('clarification_turns', 0) >= 4: return hard-stop message before any clarification call. Increment the counter after each clarification response.
+## [BLOCKING] src/agent.py around line 40-80
+User message is appended to the messages array and passed to Claude without any sanitization or prompt-injection filtering. Patterns such as 'ignore previous instructions' are not stripped before the context is sent to the LLM.
+**Fix:** Before appending user_message to st.session_state.messages, run a simple filter that detects and strips or escapes common injection patterns (e.g. 'ignore previous', 'disregard your instructions', 'new system prompt'). Log a warning when a pattern is detected but do not expose the filter logic to the user.
 
-## [BLOCKING] src/tools.py SerpApi call sites
-Security audit (third pass) still rates SerpApi raw exceptions as HIGH. If except blocks re-raise or propagate exception.args, the API key embedded in the SerpApi request URL can appear in Streamlit's error display or logs.
-**Fix:** All SerpApi calls must be wrapped in try/except Exception as e: return {"error": "Search unavailable. Please try again."}. Never reference str(e), e.args, or the request URL in any returned value.
+## [BLOCKING] src/tools.py around line 20-80
+SerpApi calls are wrapped in try/except but the except block re-raises or returns exception.args or str(e) which may contain the full request URL including the api_key query parameter. This leaks SERPAPI_API_KEY in error output passed back to the agent and potentially to the chat UI.
+**Fix:** In every except block, return only a hardcoded normalized string such as 'Search service unavailable. Please try again.' Never call str(e), repr(e), or reference exception.args. Scrub any returned error string against the known API key value before returning.
 
-## [BLOCKING] src/app.py chat submit handler
-No per-session call counter exists per the security audit (third pass still flagged MEDIUM). Without a hard cap, a single browser session can issue unlimited SerpApi and Anthropic calls, creating unbounded cost exposure.
-**Fix:** Add st.session_state.call_count (init 0). Increment on every LLM or SerpApi call. If call_count >= 20, display a warning and return without calling any external API.
+## [BLOCKING] src/app.py around line 30-60
+There is no per-session call counter in st.session_state. A user or script can submit messages in a tight loop, triggering unlimited SerpApi and Anthropic API calls with no guard. This exposes unbounded cost and is a DoS vector.
+**Fix:** On session init set st.session_state.api_call_count = 0. Increment it on every LLM and SerpApi call. Before processing any new user message, check if the count has reached 20; if so, display a warning and return without calling any API.
 
-## [BLOCKING] src/agent.py user message append
-Security audit (third pass) still flags prompt injection as HIGH. User message is appended to the Claude context without filtering instruction-override patterns.
-**Fix:** Before appending user_message to the messages array, screen for patterns like 'ignore previous', 'disregard', 'you are now', 'system:', and truncate or reject the message with a user-visible warning if matched.
+## [BLOCKING] src/agent.py around line 55-100
+The clarification turn cap of 4 specified in the agent design is not enforced in code. There is no guard that checks st.session_state.clarification_turns before calling generate_clarification_question, allowing an infinite clarification loop.
+**Fix:** Track st.session_state.clarification_turns (init to 0, increment each time generate_clarification_question is called). Before calling it, check if clarification_turns >= 4; if so, surface a message listing all still-missing slots and ask the user to provide them in one message instead of asking another question.
 
-## [SUGGESTION] src/tools.py SerpApi response parsing
-SerpApi JSON responses are passed to compose_itinerary without schema validation. A malformed payload with missing keys causes unhandled KeyError inside the composer.
-**Fix:** Validate that required keys (e.g. 'flights', 'hotels', 'price') exist before returning data. Use .get() with defaults and drop malformed entries rather than letting KeyError propagate.
+## [SUGGESTION] src/tools.py around line 25-90
+SerpApi JSON responses are consumed with direct key access (e.g. result['best_flights'][0]['price']) without checking whether the expected keys exist. A malformed or unexpected API response causes an unhandled KeyError that surfaces as a raw traceback.
+**Fix:** Use .get() with defaults throughout all SerpApi response parsing. Wrap the parsing block in a try/except KeyError and return a normalized error structure rather than crashing.
 
-## [SUGGESTION] src/agent.py slot merge logic
-If extract_intent_and_slots returns an overlapping slot value (e.g. a new destination that contradicts an earlier one), the merge strategy is unclear. A simple dict update will silently overwrite confirmed slots.
-**Fix:** Log slot overwrites at DEBUG level and, if a confirmed slot changes value mid-session, prompt the user to confirm the change rather than silently replacing it.
+## [SUGGESTION] src/agent.py around line 70-110
+Slot merging uses a shallow dict update pattern. If extract_intent_and_slots returns a key with value None (slot was seen but not filled), it overwrites a previously confirmed non-None slot value in st.session_state.slots.
+**Fix:** When merging new slots, only overwrite an existing slot value if the new value is not None. Use: for k, v in new_slots.items(): if v is not None: st.session_state.slots[k] = v
 
-## [SUGGESTION] src/agent.py compose_itinerary guard
-If both search_flights and search_hotels return errors, compose_itinerary may still be called with flights=null and hotels=null, producing an empty or misleading itinerary.
-**Fix:** Add a pre-composition guard: if flights is null and hotels is null, return a user-facing message explaining both data sources failed, and skip the compose call.
+## [SUGGESTION] src/agent.py around line 115-140
+compose_itinerary is called without a dual-null guard. If both search_flights and search_hotels return error states (flights=None, hotels=None), the composer still fires and Claude may fabricate content to fill the itinerary.
+**Fix:** Before calling compose_itinerary, check if both flights and hotels are None/empty. If so, skip the composer call and return a user-facing message stating that live data could not be retrieved for any segment.
 
-## [SUGGESTION] src/prompts.py compose_itinerary system prompt
-Security audit flagged that no runtime check strips API key values from Claude output. The system prompt alone cannot guarantee the model never echoes an injected key.
-**Fix:** After receiving compose_itinerary response from Claude, assert that SERPAPI_API_KEY and ANTHROPIC_API_KEY substrings are absent from the response string before displaying in chat.
+## [SUGGESTION] src/prompts.py around line 1-60
+No runtime post-processing strips API key substrings from Claude response text. If the LLM ever echoes a key value embedded in a previous context message, it would be displayed in the chat UI.
+**Fix:** After receiving any Claude response, run a scrub pass: assert that the SERPAPI_API_KEY and ANTHROPIC_API_KEY values (loaded from env) are not present in the response string. Replace with '[REDACTED]' if found.
 
-## [SUGGESTION] src/tools.py search_flights input validation
-Agent design requires rejecting any search_flights call missing origin_iata or departure_date and routing back to clarification. If this validation lives only in agent.py and not in tools.py, a future caller can bypass it.
-**Fix:** Add a guard at the top of search_flights: if not origin_iata or not departure_date: return {"error": "Missing required fields", "flights": []}.
+## [SUGGESTION] src/tools.py around line 18-30
+search_flights does not validate that origin_iata and destination_iata are non-empty IATA codes before calling SerpApi. Passing an empty string or city name causes a bad API call and a confusing error.
+**Fix:** At the top of search_flights, assert that origin_iata and destination_iata match a basic IATA pattern (3 uppercase letters). If validation fails, return an error dict without calling SerpApi and route back to clarification.
 
 ## [SUGGESTION] .streamlit/config.toml entire file
-Security audit flagged missing config.toml with CORS and XSRF protections. Implementation report lists config.toml as written, but the security audit in this third pass still references it as a finding.
-**Fix:** Confirm file exists at .streamlit/config.toml with [server] enableCORS = false and enableXsrfProtection = true. If present, this finding is resolved.
+config.toml is listed as written by the implementer but its content has not been confirmed to include enableCORS = false and enableXsrfProtection = true under [server]. Default Streamlit config allows CORS from any origin.
+**Fix:** Confirm config.toml contains: [server] enableCORS = false enableXsrfProtection = true. Add headless = true if this will run in any non-local environment.
