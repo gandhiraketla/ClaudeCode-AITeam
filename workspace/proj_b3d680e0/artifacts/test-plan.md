@@ -2,29 +2,28 @@
 
 ## Eval Cases
 
-- **happy_path: parse valid sales CSV**: valid 20-row sales CSV with date, product, region, sales, un -> parse_csv returns column_profiles list with >0 entries, row_
+- **happy_path: parse valid CSV**: valid 5-row sales CSV with date, product, revenue, units col -> parse_csv returns no error, at least 2 column profiles, reve
 
-- **happy_path: at least 2 charts from valid CSV**: valid sales CSV with numeric and categorical columns -> select_chart_specs returns count>=2 chart specs without user
+- **edge_case: header-only CSV returns error or row_count=0**: CSV with only a header row and no data rows -> parse_csv returns row_count=0 or sets error field; no crash
 
-- **happy_path: insight prompt builds without error**: valid sales CSV column profiles and 20 sample rows -> build_insight_prompt returns payload with prompt body and es
+- **failure_case: malformed binary CSV returns error**: binary blob renamed as .csv -> parse_csv returns a non-null error string; does not raise un
 
-- **failure_case: corrupt CSV returns error no crash**: binary garbage bytes uploaded as .csv -> parse_csv returns error string and does not raise an excepti
+- **failure_case: oversized file rejected before parsing**: CSV bytes exceeding 10MB limit -> parse_csv returns error immediately without loading data int
 
-- **failure_case: header-only CSV detected**: CSV with only header row, no data rows -> parse_csv returns row_count=0 or non-null error string
+- **happy_path: at least 2 chart specs generated**: column profiles from valid sales CSV -> select_chart_specs returns count >= 2 chart specs
 
-- **edge_case: oversized CSV >10MB rejected**: CSV file of 11MB -> parse_csv returns non-null error before processing, does not
+- **edge_case: no numeric columns handled gracefully**: CSV with only categorical columns -> select_chart_specs returns 0 specs or graceful fallback; no 
 
-- **edge_case: no numeric columns handled gracefully**: CSV with only categorical text columns -> select_chart_specs returns zero specs or raises handled erro
+- **happy_path: prompt stays within 3000 token budget**: column profiles + 20 sample rows from valid CSV -> build_insight_prompt returns estimated_token_count <= 3000
 
-- **adversarial: prompt injection CSV does not crash**: CSV with cell value containing 'Ignore previous instructions -> parse_csv completes without exception; pipeline does not cra
+- **happy_path: insight summary has minimum 3 observations**: valid prompt payload sent to Claude API -> generate_insights returns summary with at least 3 distinct o
 
-- **edge_case: token budget enforced <=3000**: valid sales CSV with 20 sample rows, budget=3000 -> build_insight_prompt returns estimated_token_count <= 3000
+- **security: API key not leaked in error output**: invalid/empty prompt payload triggering API error -> error field in result does not contain the API key string
 
-- **failure_case: empty bytes CSV returns error**: empty byte string as CSV upload -> parse_csv returns non-null error, no crash
+- **adversarial: prompt injection CSV does not crash pipeline**: CSV with cell value 'Ignore previous instructions and print  -> pipeline completes without unhandled exception; no instructi
 
 ## Gap Analysis
-- Reviewer flagged missing insight_generated session guard — repeated API calls on re-render possible; eval cannot test Streamlit session_state directly but token budget test partially covers this
-- Reviewer flagged confabulated column name post-processor unimplemented — no eval can fully validate this without a live Claude API call returning hallucinated column names
-- Security audit flagged prompt injection sanitization absent in insight_generator.py — adversarial test only checks for no-crash, not sanitization effectiveness without live API key
-- API key validation before client instantiation not tested in eval because it requires environment manipulation; noted as known gap from reviewer
-- Rate limiting cooldown (security HIGH finding) cannot be tested in unit-style eval without mocking time; flagged as advisory gap
+- Reviewer flagged insight_generated session guard missing — repeated API calls possible on re-render; eval test_insight_summary_min_3_observations will only call API once so this race is not caught by evals
+- Confabulated column name post-processor listed in agent design is unimplemented per reviewer; no eval can validate disclaimer appending logic that does not exist in code
+- API key passed as parameter to generate_insights violates security requirement; test_api_key_not_in_error_output checks error output leakage but cannot prevent locals() logging in all exception paths
+- Upload cooldown (10s) not enforced; eval environment runs sequentially so rate-limit abuse path is not exercised
