@@ -1,231 +1,206 @@
-"""Agent Orchestrator for the Travel Itinerary Agent."""
-from __future__ import annotations
+"""Agent orchestrator for the Travel Itinerary Agent."""
 import json
 import os
 import anthropic
 from src.state import (
-    get_messages, append_message, get_slots, merge_slots,
-    get_search_results, set_flight_results, set_hotel_results,
-    get_clarification_turns, increment_clarification_turns,
-    clarification_limit_reached, increment_session_calls,
-    set_intent, get_intent, get_recent_messages,
-    MAX_CLARIFICATION_TURNS,
+    init_state, append_message, merge_slots, get_recent_messages,
+    get_all_messages, increment_call_count, is_call_limit_reached,
+    increment_clarification_turns, is_clarification_cap_reached,
+    set_search_results, get_search_results, set_intent, get_intent
 )
 from src.prompts import (
-    AGENT_SYSTEM_PROMPT, INTENT_EXTRACTION_PROMPT,
-    CLARIFICATION_PROMPT, ITINERARY_COMPOSITION_PROMPT,
-    sanitize_user_input, assert_no_key_leak, build_slots_summary,
+    SYSTEM_PROMPT, EXTRACT_INTENT_SYSTEM, EXTRACT_INTENT_TEMPLATE,
+    CLARIFICATION_SYSTEM, CLARIFICATION_TEMPLATE,
+    COMPOSE_ITINERARY_SYSTEM, COMPOSE_ITINERARY_TEMPLATE,
+    sanitize_user_input, strip_api_keys
 )
-from src.tools import search_flights, search_hotels, resolve_iata
-
-MODEL = "claude-opus-4-5"
-MAX_TOKENS = 2048
-
-BOOKING_KEYWORDS = ["book", "reserve", "confirm", "purchase", "pay", "buy ticket"]
+from src.tools import search_flights, search_hotels
+import streamlit as st
 
 
 def _get_client() -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    return anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
-def _call_claude(system: str, messages: list[dict], max_tokens: int = MAX_TOKENS) -> str:
+def _call_claude(system: str, user: str, max_tokens: int = 1024) -> str:
+    """Call Claude and return the text response. Increments call counter."""
+    if increment_call_count():
+        return json.dumps({"error": "Session API call limit reached. Please start a new session."})
     client = _get_client()
     response = client.messages.create(
-        model=MODEL,
+        model="claude-opus-4-5",
         max_tokens=max_tokens,
         system=system,
-        messages=messages,
+        messages=[{"role": "user", "content": user}]
     )
-    raw = response.content[0].text
-    return assert_no_key_leak(raw)
+    return strip_api_keys(response.content[0].text)
 
 
-def _parse_json_response(text: str) -> dict:
-    """Extract JSON from LLM response, stripping markdown fences if present."""
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+def _extract_intent_and_slots(user_message: str) -> dict:
+    history_text = json.dumps(get_recent_messages(10), ensure_ascii=False)
+    prompt = EXTRACT_INTENT_TEMPLATE.format(
+        history=history_text,
+        user_message=user_message
+    )
+    raw = _call_claude(EXTRACT_INTENT_SYSTEM, prompt, max_tokens=512)
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {}
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise ValueError("Not a dict")
+        return result
+    except Exception:
+        return {"intent": "unclear", "slots": {}, "missing_required": []}
 
 
-def _is_booking_request(message: str) -> bool:
-    lowered = message.lower()
-    return any(kw in lowered for kw in BOOKING_KEYWORDS)
-
-
-def extract_intent_and_slots(user_message: str) -> dict:
-    """Call Claude to extract intent and travel slots from conversation."""
-    recent = get_recent_messages(10)
-    messages_for_extraction = [
-        {"role": "user", "content": INTENT_EXTRACTION_PROMPT +
-         "\n\nConversation:\n" + json.dumps(recent) +
-         "\n\nLatest user message: " + user_message}
-    ]
-    raw = _call_claude("You are a travel data extractor. Return only valid JSON.",
-                       messages_for_extraction, max_tokens=512)
-    result = _parse_json_response(raw)
-    if not result:
-        return {
-            "intent": "unclear",
-            "slots": {},
-            "missing_required": ["destination"],
-        }
-    return result
-
-
-def generate_clarification_question(intent: str, slots: dict, missing: list[str]) -> dict:
-    """Ask Claude to produce a single clarifying question for the first missing slot."""
-    prompt = CLARIFICATION_PROMPT.format(
-        missing_required=missing,
-        confirmed_slots={k: v for k, v in slots.items() if v is not None},
+def _generate_clarification(intent: str, missing_required: list) -> str:
+    confirmed_slots = st.session_state.get("slots", {})
+    prompt = CLARIFICATION_TEMPLATE.format(
         intent=intent,
+        confirmed_slots=json.dumps(confirmed_slots),
+        missing_required=json.dumps(missing_required)
     )
-    raw = _call_claude("You are a travel assistant. Return only valid JSON.",
-                       [{"role": "user", "content": prompt}], max_tokens=256)
-    result = _parse_json_response(raw)
-    if not result or "question" not in result:
-        return {"question": f"Could you please provide your {missing[0]}?",
-                "slot_being_asked": missing[0]}
-    return result
+    raw = _call_claude(CLARIFICATION_SYSTEM, prompt, max_tokens=256)
+    try:
+        result = json.loads(raw)
+        return result.get("question", "Could you provide more details about your trip?")
+    except Exception:
+        return "Could you provide more details about your trip?"
 
 
-def compose_itinerary(slots: dict, flights: list | None, hotels: list | None, intent: str) -> str:
-    """Call Claude to compose a structured day-by-day itinerary from tool results."""
-    if flights is None and hotels is None:
-        return ("I was unable to retrieve live flight or hotel data for your trip. "
-                "Please try again or check travel sites directly.")
-    slots_summary = build_slots_summary(slots)
-    flights_json = json.dumps(flights, indent=2) if flights else "null"
-    hotels_json = json.dumps(hotels, indent=2) if hotels else "null"
-    prompt = ITINERARY_COMPOSITION_PROMPT.format(
-        slots_summary=slots_summary,
-        flights_json=flights_json,
-        hotels_json=hotels_json,
+def _resolve_iata(location: str) -> str:
+    """Return IATA code if already one, else use as-is (SerpApi handles city names)."""
+    if location and len(location.strip()) == 3 and location.strip().isalpha():
+        return location.strip().upper()
+    return location.strip() if location else ""
+
+
+def _compose_itinerary(slots: dict, flights: list, hotels: list, intent: str) -> str:
+    prompt = COMPOSE_ITINERARY_TEMPLATE.format(
+        slots=json.dumps(slots),
+        flights=json.dumps(flights) if flights else "null",
+        hotels=json.dumps(hotels) if hotels else "null",
+        intent=intent
     )
-    all_messages = get_messages()
-    messages_for_compose = list(all_messages) + [{"role": "user", "content": prompt}]
-    return _call_claude(AGENT_SYSTEM_PROMPT, messages_for_compose, max_tokens=2048)
+    raw = _call_claude(COMPOSE_ITINERARY_SYSTEM, prompt, max_tokens=2048)
+    try:
+        result = json.loads(raw)
+        md = result.get("itinerary_markdown", "")
+        warnings = result.get("warnings", [])
+        if warnings:
+            md += "\n\n**Notices:**\n" + "\n".join(f"- {w}" for w in warnings)
+        return strip_api_keys(md)
+    except Exception:
+        return strip_api_keys(raw)
 
 
-def process_message(user_message: str) -> str:
-    """Main agent entry point. Returns assistant response string."""
-    # Rate limit check
-    if increment_session_calls():
-        return ("You have reached the maximum number of requests for this session. "
-                "Please refresh the page to start a new session.")
+def _check_booking_request(text: str) -> bool:
+    lower = text.lower()
+    booking_keywords = ["book ", "booking", "reserve", "reservation", "confirm", "pay ", "payment", "purchase"]
+    return any(kw in lower for kw in booking_keywords)
 
-    # Sanitize input
-    clean_message = sanitize_user_input(user_message)
 
-    # Scope guardrail: booking requests
-    if _is_booking_request(clean_message):
-        return ("Booking is not available in this version. "
-                "I can help you refine your itinerary instead.")
+def run_agent(user_message: str) -> str:
+    """Main entry point. Process user message and return assistant response."""
+    init_state()
 
-    # Append user message to history
-    append_message("user", clean_message)
+    if is_call_limit_reached():
+        return "You have reached the maximum number of API calls for this session. Please refresh to start a new session."
 
-    # Extract intent and slots
-    extraction = extract_intent_and_slots(clean_message)
+    sanitized = sanitize_user_input(user_message)
+    append_message("user", sanitized)
+
+    if _check_booking_request(sanitized):
+        response = ("Booking, payment, and reservation confirmation are out of scope in V1. "
+                    "I can help you build a detailed itinerary with real flight and hotel options. "
+                    "Would you like me to refine your itinerary?")
+        append_message("assistant", response)
+        return response
+
+    extraction = _extract_intent_and_slots(sanitized)
     intent = extraction.get("intent", "unclear")
     new_slots = extraction.get("slots", {})
-    missing = extraction.get("missing_required", [])
+    missing_required = extraction.get("missing_required", [])
 
-    # Merge newly extracted slots
-    merge_slots(new_slots)
-    slots = get_slots()
-    set_intent(intent)
+    if isinstance(new_slots, dict):
+        merge_slots(new_slots)
+    if intent and intent != "unclear":
+        set_intent(intent)
+    else:
+        intent = get_intent() or "unclear"
 
-    # Unclear intent: ask for destination
-    if intent == "unclear":
-        question = "Where would you like to travel, and what dates are you thinking?"
-        append_message("assistant", question)
-        return question
+    slots = st.session_state.slots
 
-    # Check for missing required slots
-    if missing:
-        # Clarification limit enforcement
-        if clarification_limit_reached():
-            still_missing = ", ".join(missing)
-            response = (
-                f"I still need the following information to proceed: {still_missing}. "
-                "Could you please provide all of these in one message?"
-            )
+    if missing_required:
+        if is_clarification_cap_reached():
+            still_missing = ", ".join(missing_required)
+            response = (f"I still need the following information to proceed: {still_missing}. "
+                        "Please provide all of them in your next message.")
             append_message("assistant", response)
             return response
-
         increment_clarification_turns()
-        clarification = generate_clarification_question(intent, slots, missing)
-        question = clarification.get("question", f"Could you provide your {missing[0]}?")
+        question = _generate_clarification(intent, missing_required)
         append_message("assistant", question)
         return question
 
-    # All required slots present — execute searches
-    flight_result = {"flights": None, "error": None}
-    hotel_result = {"hotels": None, "error": None}
-    warnings = []
+    # Reset clarification counter once slots are complete
+    st.session_state.clarification_turns = 0
 
-    # Flight search
+    flights_result = None
+    hotels_result = None
+
     if intent in ("full_itinerary", "flights_only"):
-        origin = resolve_iata(slots.get("origin", ""))
-        destination = resolve_iata(slots.get("destination", ""))
+        origin = _resolve_iata(slots.get("origin", ""))
+        destination = _resolve_iata(slots.get("destination", ""))
         departure_date = slots.get("departure_date", "")
         return_date = slots.get("return_date")
-        num_travelers = slots.get("num_travelers", 1) or 1
+        num_travelers = int(slots.get("num_travelers") or 1)
         if origin and destination and departure_date:
-            flight_result = search_flights(
+            flights_result = search_flights(
                 origin_iata=origin,
                 destination_iata=destination,
                 departure_date=departure_date,
                 return_date=return_date,
-                num_travelers=int(num_travelers),
+                num_travelers=num_travelers
             )
-            set_flight_results(flight_result.get("flights"))
-            if flight_result.get("error"):
-                warnings.append(flight_result["error"])
+            set_search_results(flights_result.get("flights"), None)
         else:
-            warnings.append("Flight search skipped — missing origin, destination, or date.")
+            flights_result = {"flights": [], "error": "Missing flight search parameters"}
 
-    # Hotel search
     if intent in ("full_itinerary", "hotels_only"):
         destination = slots.get("destination", "")
-        check_in = slots.get("check_in_date") or slots.get("departure_date")
-        check_out = slots.get("check_out_date") or slots.get("return_date")
-        num_guests = slots.get("num_travelers", 1) or 1
+        check_in = slots.get("check_in_date") or slots.get("departure_date", "")
+        check_out = slots.get("check_out_date") or slots.get("return_date", "")
+        num_guests = int(slots.get("num_travelers") or 1)
         budget = slots.get("budget_usd")
-        # Skip hotel search if check-in == check-out (same-day trip)
+        # Skip hotel search if same-day trip
         if destination and check_in and check_out and check_in != check_out:
-            hotel_result = search_hotels(
+            hotels_result = search_hotels(
                 destination=destination,
                 check_in_date=check_in,
                 check_out_date=check_out,
-                num_guests=int(num_guests),
-                budget_usd_per_night=float(budget) if budget else None,
+                num_guests=num_guests,
+                budget_usd_per_night=float(budget) if budget else None
             )
-            set_hotel_results(hotel_result.get("hotels"))
-            if hotel_result.get("error"):
-                warnings.append(hotel_result["error"])
+            set_search_results(None, hotels_result.get("hotels"))
+        elif intent == "hotels_only":
+            hotels_result = {"hotels": [], "error": "Missing hotel search parameters or same-day trip"}
+
+    search_cache = get_search_results()
+    flights_data = (flights_result.get("flights") if flights_result else None) or search_cache.get("flights")
+    hotels_data = (hotels_result.get("hotels") if hotels_result else None) or search_cache.get("hotels")
+
+    if not flights_data and not hotels_data:
+        flight_err = (flights_result or {}).get("error", "")
+        hotel_err = (hotels_result or {}).get("error", "")
+        errors = [e for e in [flight_err, hotel_err] if e]
+        if errors:
+            response = ("I was unable to retrieve live data: " + "; ".join(errors) +
+                        ". Please check your inputs and try again.")
         else:
-            if check_in == check_out:
-                warnings.append("Hotel search skipped — same-day trip detected.")
-            else:
-                warnings.append("Hotel search skipped — missing destination or dates.")
+            response = "No results found. Please verify your destination, dates, and try again."
+        append_message("assistant", response)
+        return response
 
-    # Compose itinerary
-    itinerary = compose_itinerary(
-        slots=slots,
-        flights=flight_result.get("flights"),
-        hotels=hotel_result.get("hotels"),
-        intent=intent,
-    )
-
-    if warnings:
-        warning_block = "\n\n> ⚠️ " + "\n> ⚠️ ".join(warnings)
-        itinerary = itinerary + warning_block
-
-    append_message("assistant", itinerary)
-    return itinerary
+    response = _compose_itinerary(slots, flights_data, hotels_data, intent)
+    append_message("assistant", response)
+    return response

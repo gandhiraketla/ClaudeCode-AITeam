@@ -1,90 +1,96 @@
 """Session state management for the Travel Itinerary Agent."""
-from __future__ import annotations
 import streamlit as st
-from typing import Any
 
+MAX_CALLS_PER_SESSION = 20
 MAX_CLARIFICATION_TURNS = 4
-MAX_SESSION_CALLS = 20
-
-DEFAULT_STATE: dict[str, Any] = {
-    "messages": [],
-    "slots": {},
-    "last_search_results": {"flights": None, "hotels": None},
-    "clarification_turns": 0,
-    "session_calls": 0,
-    "intent": None,
-}
 
 
 def init_state() -> None:
-    """Initialize st.session_state with default values if not already set."""
-    for key, value in DEFAULT_STATE.items():
-        if key not in st.session_state:
-            import copy
-            st.session_state[key] = copy.deepcopy(value)
-
-
-def get_messages() -> list[dict]:
-    return st.session_state.messages
+    """Initialize all session state keys if not already present."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "slots" not in st.session_state:
+        st.session_state.slots = {}
+    if "last_search_results" not in st.session_state:
+        st.session_state.last_search_results = {"flights": None, "hotels": None}
+    if "clarification_turns" not in st.session_state:
+        st.session_state.clarification_turns = 0
+    if "call_count" not in st.session_state:
+        st.session_state.call_count = 0
+    if "intent" not in st.session_state:
+        st.session_state.intent = None
 
 
 def append_message(role: str, content: str) -> None:
+    """Append a message to conversation history."""
     st.session_state.messages.append({"role": role, "content": content})
 
 
-def get_slots() -> dict:
-    return st.session_state.slots
-
-
 def merge_slots(new_slots: dict) -> None:
-    """Merge new slot values into existing slots, never overwriting with None."""
-    for k, v in new_slots.items():
-        if v is not None and v != "":
-            st.session_state.slots[k] = v
+    """Merge newly extracted slots into accumulated slots (never overwrite with None)."""
+    for key, value in new_slots.items():
+        if value is not None and value != "" and value != []:
+            st.session_state.slots[key] = value
 
 
-def get_search_results() -> dict:
-    return st.session_state.last_search_results
+def get_recent_messages(n: int = 10) -> list:
+    """Return the last n messages for token-limited calls."""
+    return st.session_state.messages[-n:]
 
 
-def set_flight_results(flights: list | None) -> None:
-    st.session_state.last_search_results["flights"] = flights
+def get_all_messages() -> list:
+    """Return full conversation history."""
+    return list(st.session_state.messages)
 
 
-def set_hotel_results(hotels: list | None) -> None:
-    st.session_state.last_search_results["hotels"] = hotels
+def increment_call_count() -> bool:
+    """Increment call counter. Returns True if limit exceeded."""
+    st.session_state.call_count += 1
+    return st.session_state.call_count > MAX_CALLS_PER_SESSION
 
 
-def get_clarification_turns() -> int:
-    return st.session_state.clarification_turns
+def is_call_limit_reached() -> bool:
+    """Check if per-session API call limit has been reached."""
+    return st.session_state.call_count >= MAX_CALLS_PER_SESSION
 
 
 def increment_clarification_turns() -> None:
+    """Increment the clarification turn counter."""
     st.session_state.clarification_turns += 1
 
 
-def clarification_limit_reached() -> bool:
+def is_clarification_cap_reached() -> bool:
+    """Check if clarification turn cap has been reached."""
     return st.session_state.clarification_turns >= MAX_CLARIFICATION_TURNS
 
 
-def increment_session_calls() -> bool:
-    """Increment call counter. Returns True if limit exceeded."""
-    st.session_state.session_calls += 1
-    return st.session_state.session_calls > MAX_SESSION_CALLS
+def set_search_results(flights: list | None, hotels: list | None) -> None:
+    """Store the latest search results."""
+    if flights is not None:
+        st.session_state.last_search_results["flights"] = flights
+    if hotels is not None:
+        st.session_state.last_search_results["hotels"] = hotels
 
 
-def get_session_calls() -> int:
-    return st.session_state.session_calls
+def get_search_results() -> dict:
+    """Retrieve the latest cached search results."""
+    return st.session_state.last_search_results
 
 
-def set_intent(intent: str | None) -> None:
+def set_intent(intent: str) -> None:
+    """Store the current detected intent."""
     st.session_state.intent = intent
 
 
 def get_intent() -> str | None:
+    """Get the current detected intent."""
     return st.session_state.intent
 
 
-def get_recent_messages(n: int = 10) -> list[dict]:
-    """Return the last n messages for intent extraction (context window management)."""
-    return st.session_state.messages[-n:]
+def reset_session() -> None:
+    """Clear all session state (for testing / manual reset)."""
+    for key in ["messages", "slots", "last_search_results",
+                "clarification_turns", "call_count", "intent"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    init_state()
