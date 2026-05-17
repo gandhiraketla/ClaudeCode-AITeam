@@ -1,0 +1,13 @@
+graph TD
+  A[Analyst Browser] -->|Upload CSV| B[Streamlit App — app.py]
+  B --> C[CSV Parser — pandas]
+  C --> D[Column Detector]
+  D --> E[Chart Engine — Plotly]
+  D --> F[AI Insight Generator]
+  F -->|Schema + 20-row sample| G[Anthropic Claude API]
+  G -->|Plain-English summary| F
+  E --> H[Results Renderer — Streamlit]
+  F --> H
+  H -->|Charts + Summary| A
+  B --> I[Error Handler]
+  I -->|st.error message| A
