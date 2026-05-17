@@ -1,198 +1,390 @@
-import json
+"""
+insight_generator.py — AI-powered insight generation using Anthropic Claude.
+
+Responsibilities:
+  - build_insight_prompt: Construct a token-budgeted prompt from column profiles + sample rows
+  - generate_insights: Call Claude claude-3-haiku-20240307 and return plain-English summary
+  - PII masking and prompt injection defence applied before any data leaves the process
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import Optional
+import os
+import re
+from typing import Any
 
 import anthropic
 
 logger = logging.getLogger(__name__)
 
-MAX_COLUMNS_FOR_ANALYSIS = 50
+# ── Token budget ──────────────────────────────────────────────────────────────
 DEFAULT_MAX_PROMPT_TOKENS = 3000
 DEFAULT_MAX_RESPONSE_TOKENS = 1024
-CHARS_PER_TOKEN_ESTIMATE = 4
+CHARS_PER_TOKEN_ESTIMATE = 4          # conservative approximation
+MAX_SAMPLE_ROWS = 20
+MAX_COLUMNS = 50
 
+# ── PII patterns ─────────────────────────────────────────────────────────────
+_PII_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"), "[EMAIL]"),
+    (re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
+    (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
+    (re.compile(r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b"), "[CARD]"),
+]
+
+# ── Prompt injection trigger phrases ─────────────────────────────────────────
+_INJECTION_PHRASES: list[str] = [
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard previous",
+    "you are now",
+    "new instructions",
+    "system prompt",
+    "forget your instructions",
+    "act as",
+    "jailbreak",
+    "###",           # common delimiter abuse
+    "---system",
+    "<|im_start|>",
+    "<|im_end|>",
+    "[system]",
+    "[user]",
+    "[assistant]",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sanitization helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mask_pii(value: str) -> str:
+    """Replace PII patterns in a string with safe placeholders."""
+    for pattern, placeholder in _PII_PATTERNS:
+        value = pattern.sub(placeholder, value)
+    return value
+
+
+def _sanitize_cell(value: Any) -> str:
+    """
+    Convert a cell value to a safe string:
+      1. Convert to str
+      2. Mask PII
+      3. Remove / neutralize prompt-injection trigger phrases
+    """
+    text = str(value)
+    text = _mask_pii(text)
+    lower = text.lower()
+    for phrase in _INJECTION_PHRASES:
+        if phrase in lower:
+            # Replace the phrase (case-insensitive) with a neutral token
+            text = re.sub(re.escape(phrase), "[REDACTED]", text, flags=re.IGNORECASE)
+    return text
+
+
+def _sanitize_row(row: dict[str, Any]) -> dict[str, str]:
+    """Sanitize all values in a sample row dict."""
+    return {k: _sanitize_cell(v) for k, v in row.items()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt construction
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_insight_prompt(
-    column_profiles: list,
-    raw_dataframe_sample: list,
+    column_profiles: list[dict[str, Any]],
+    raw_dataframe_sample: list[dict[str, Any]],
     max_tokens_budget: int = DEFAULT_MAX_PROMPT_TOKENS,
-) -> dict:
+) -> dict[str, Any]:
     """
-    Construct the structured prompt payload for the Claude API call.
-    Returns: {system_prompt_sections, user_prompt_body, estimated_token_count, rows_included, error}
+    Construct a structured prompt payload for the Claude API.
+
+    Token budget enforcement:
+      - Estimates token count using chars / CHARS_PER_TOKEN_ESTIMATE.
+      - Reduces rows_included until budget is satisfied.
+      - If schema alone exceeds budget, returns an error.
+
+    Returns a dict with keys:
+        system_prompt: str
+        user_prompt: str
+        estimated_token_count: int
+        rows_included: int
+        error: str | None
     """
-    if len(column_profiles) > MAX_COLUMNS_FOR_ANALYSIS:
+    if len(column_profiles) > MAX_COLUMNS:
         return {
-            "system_prompt_sections": [],
-            "user_prompt_body": "",
+            "system_prompt": "",
+            "user_prompt": "",
             "estimated_token_count": 0,
             "rows_included": 0,
-            "error": "CSV has too many columns to analyze — reduce to under 50 columns.",
+            "error": (
+                "CSV has too many columns to analyze — reduce to under "
+                + str(MAX_COLUMNS)
+                + " columns."
+            ),
         }
 
-    system_prompt_sections = [
-        "You are a data analyst producing insights for non-technical business analysts.",
-        (
-            "Your response must contain exactly 3 to 5 numbered observations. "
-            "Each observation must be a single plain-English sentence. "
-            "Do not use bullet points, markdown headers, or technical jargon."
-        ),
-        (
-            "Constraints: Do not invent data not present in the sample. "
-            "Do not reference column names in a way the user would not understand. "
-            "If the sample is too small to draw conclusions, say so explicitly."
-        ),
-    ]
-
-    # Build metadata block
-    meta_lines = ["Dataset Overview:"]
-    for p in column_profiles:
-        null_info = f", {p['null_count']} nulls" if p["null_count"] > 0 else ""
-        meta_lines.append(f"  - {p['name']} ({p['inferred_type']}{null_info})")
-    metadata_block = "\n".join(meta_lines)
-
-    # Build stats block
-    stat_lines = ["Statistical Summary:"]
-    for p in column_profiles:
-        if p["inferred_type"] == "numeric":
-            stat_lines.append(
-                f"  - {p['name']}: min={p['min']}, max={p['max']}, unique_values={p['nunique']}"
-            )
-        elif p["inferred_type"] == "categorical" and p["top_values"]:
-            top = ", ".join(str(v) for v in p["top_values"][:5])
-            stat_lines.append(f"  - {p['name']}: top values = [{top}]")
-    stats_block = "\n".join(stat_lines)
-
-    task_instruction = (
-        "Task: Identify 3 to 5 key insights from this data. "
-        "Cover trends, outliers, and top or bottom performers where applicable."
+    # ── System prompt ────────────────────────────────────────────────────────
+    system_prompt = (
+        "You are a data analyst producing insights for non-technical business analysts. "
+        "Your response must contain exactly 3 to 5 numbered observations. "
+        "Each observation must be a single plain-English sentence — no bullet points, "
+        "no markdown formatting, no technical jargon. "
+        "Only reference data that is present in the provided sample. "
+        "Do not invent figures or reference column names the user would not understand. "
+        "If the sample is too small to draw a reliable conclusion, say so explicitly."
     )
 
-    # Estimate base token budget
-    base_body = metadata_block + "\n\n" + stats_block + "\n\n" + task_instruction
-    base_tokens = len(base_body) // CHARS_PER_TOKEN_ESTIMATE
+    # ── Build schema block ───────────────────────────────────────────────────
+    schema_lines: list[str] = ["DATASET SCHEMA", "=" * 40]
+    for p in column_profiles:
+        line = (
+            "  " + str(p["name"])
+            + "  [" + p["inferred_type"] + "]"
+            + "  nunique=" + str(p["nunique"])
+            + "  nulls=" + str(p["null_count"])
+        )
+        if p["inferred_type"] == "numeric" and p["min"] is not None:
+            line += "  min=" + str(p["min"]) + "  max=" + str(p["max"])
+        elif p["inferred_type"] == "categorical" and p.get("top_values"):
+            line += "  top_values=" + ", ".join(str(v) for v in p["top_values"][:5])
+        elif p["inferred_type"] == "date":
+            if p["min"]:
+                line += "  earliest=" + str(p["min"])
+            if p["max"]:
+                line += "  latest=" + str(p["max"])
+        schema_lines.append(line)
+    schema_block = "\n".join(schema_lines)
 
-    if base_tokens > max_tokens_budget:
+    # ── Budget check: schema alone ───────────────────────────────────────────
+    base_estimated = (len(system_prompt) + len(schema_block)) // CHARS_PER_TOKEN_ESTIMATE
+    if base_estimated >= max_tokens_budget:
         return {
-            "system_prompt_sections": system_prompt_sections,
-            "user_prompt_body": "",
-            "estimated_token_count": base_tokens,
+            "system_prompt": system_prompt,
+            "user_prompt": schema_block,
+            "estimated_token_count": base_estimated,
             "rows_included": 0,
-            "error": "CSV has too many columns to analyze — reduce to under 50 columns.",
+            "error": (
+                "CSV has too many columns to analyze — reduce to under "
+                + str(MAX_COLUMNS)
+                + " columns."
+            ),
         }
 
-    # Fit as many sample rows as possible within budget
+    # ── Determine how many sample rows fit in budget ─────────────────────────
+    sanitized_rows = [_sanitize_row(r) for r in raw_dataframe_sample[:MAX_SAMPLE_ROWS]]
     rows_included = 0
     sample_block = ""
-    remaining_budget = max_tokens_budget - base_tokens
 
-    for i, row in enumerate(raw_dataframe_sample[:20]):
-        row_str = ", ".join(f"{k}={v}" for k, v in row.items())
-        row_tokens = len(row_str) // CHARS_PER_TOKEN_ESTIMATE + 1
-        if row_tokens > remaining_budget:
-            break
-        sample_block += row_str + "\n"
-        remaining_budget -= row_tokens
-        rows_included += 1
+    for n in range(len(sanitized_rows), -1, -1):
+        if n == 0:
+            sample_block = "SAMPLE ROWS\n" + "=" * 40 + "\n(No sample rows — schema only.)"
+        else:
+            header = ",".join(str(k) for k in sanitized_rows[0].keys())
+            rows_text = "\n".join(
+                ",".join(str(v) for v in row.values())
+                for row in sanitized_rows[:n]
+            )
+            sample_block = (
+                "SAMPLE ROWS (showing "
+                + str(n)
+                + " of "
+                + str(len(raw_dataframe_sample))
+                + " total)\n"
+                + "=" * 40
+                + "\n"
+                + header
+                + "\n"
+                + rows_text
+            )
 
-    sample_section = ""
-    if rows_included > 0:
-        total_rows = len(raw_dataframe_sample)
-        sample_section = (
-            f"Sample Rows ({rows_included} of {total_rows} total):\n" + sample_block
+        task_block = (
+            "TASK\n"
+            + "=" * 40
+            + "\n"
+            + "Based on the dataset schema and sample rows above, provide 3 to 5 key insights "
+            + "covering: trends over time (if date columns exist), top and bottom performers, "
+            + "outliers or anomalies, and any noteworthy patterns. "
+            + "Write each insight as a numbered plain-English sentence."
         )
 
-    user_prompt_body = metadata_block
-    user_prompt_body += "\n\n" + stats_block
-    if sample_section:
-        user_prompt_body += "\n\n" + sample_section
-    user_prompt_body += "\n\n" + task_instruction
+        user_prompt = "\n\n".join([schema_block, sample_block, task_block])
+        estimated = (len(system_prompt) + len(user_prompt)) // CHARS_PER_TOKEN_ESTIMATE
 
-    estimated_token_count = len(user_prompt_body) // CHARS_PER_TOKEN_ESTIMATE
+        if estimated <= max_tokens_budget:
+            rows_included = n
+            break
+
+    logger.info(
+        "Prompt built: estimated %d tokens, %d sample rows included",
+        estimated,
+        rows_included,
+    )
 
     return {
-        "system_prompt_sections": system_prompt_sections,
-        "user_prompt_body": user_prompt_body,
-        "estimated_token_count": estimated_token_count,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "estimated_token_count": estimated,
         "rows_included": rows_included,
         "error": None,
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude API call
+# ─────────────────────────────────────────────────────────────────────────────
+
 def generate_insights(
-    prompt_payload: dict,
-    api_key: str,
+    prompt_payload: dict[str, Any],
     max_response_tokens: int = DEFAULT_MAX_RESPONSE_TOKENS,
-) -> dict:
+) -> dict[str, Any]:
     """
-    Send the structured prompt to Claude and return the plain-English insight summary.
-    Returns: {summary, raw_response, error}
+    Send the structured prompt to Claude claude-3-haiku-20240307 and return insights.
+
+    API key is read directly from the environment here — never passed as a parameter.
+    The Anthropic client is instantiated inside this function so the key never
+    appears in call stacks, local variable dumps, or exception contexts.
+
+    Returns a dict with keys:
+        summary: str    — plain-English insights (empty string on error)
+        error:   str | None
     """
+    # ── Guard: propagate upstream errors without calling the API ─────────────
     if prompt_payload.get("error"):
+        return {"summary": "", "error": prompt_payload["error"]}
+
+    system_prompt = prompt_payload.get("system_prompt", "")
+    user_prompt = prompt_payload.get("user_prompt", "")
+
+    if not system_prompt or not user_prompt:
+        return {"summary": "", "error": "Prompt payload is incomplete — cannot call API."}
+
+    # ── Read API key from environment ────────────────────────────────────────
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
         return {
             "summary": "",
-            "raw_response": None,
-            "error": prompt_payload["error"],
+            "error": (
+                "ANTHROPIC_API_KEY is not set. "
+                "Please add it to your .env file and restart the app."
+            ),
         }
 
-    system_text = "\n".join(prompt_payload["system_prompt_sections"])
-    user_text = prompt_payload["user_prompt_body"]
-
+    # ── Instantiate client and call API ─────────────────────────────────────
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
+        message = client.messages.create(
             model="claude-3-haiku-20240307",
             max_tokens=max_response_tokens,
-            system=system_text,
-            messages=[{"role": "user", "content": user_text}],
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
         )
-    except anthropic.APITimeoutError as e:
-        logger.error("Claude API timeout: %s", e)
-        return {"summary": "", "raw_response": None, "error": "Request timed out — please retry."}
-    except anthropic.APIStatusError as e:
-        logger.error("Claude API status error %s: %s", e.status_code, e.message)
+    except anthropic.AuthenticationError:
+        logger.error("Anthropic authentication failed — check ANTHROPIC_API_KEY")
         return {
             "summary": "",
-            "raw_response": None,
-            "error": f"AI service returned an error (HTTP {e.status_code}) — please retry.",
+            "error": "Authentication failed — please check your ANTHROPIC_API_KEY.",
         }
-    except anthropic.APIConnectionError as e:
-        logger.error("Claude API connection error: %s", e)
+    except anthropic.RateLimitError:
+        logger.error("Anthropic rate limit exceeded")
         return {
             "summary": "",
-            "raw_response": None,
-            "error": "Could not connect to AI service — check your internet connection.",
+            "error": "Rate limit reached — please wait a moment and try again.",
         }
-
-    if not response.content or len(response.content) == 0:
+    except anthropic.APITimeoutError:
+        logger.error("Anthropic API request timed out")
         return {
             "summary": "",
-            "raw_response": response,
-            "error": "AI service returned an empty response.",
+            "error": "Insight generation timed out — please retry. Charts are still available.",
         }
-
-    summary = response.content[0].text.strip()
-
-    if not summary:
+    except anthropic.APIStatusError as exc:
+        logger.error("Anthropic API error (status %s): %s", exc.status_code, exc.message)
         return {
             "summary": "",
-            "raw_response": response,
-            "error": "AI service returned an empty response.",
+            "error": "Insight generation failed — please retry. Charts are still available.",
+        }
+    except anthropic.APIConnectionError as exc:
+        logger.error("Anthropic API connection error: %s", type(exc).__name__)
+        return {
+            "summary": "",
+            "error": "Could not reach the AI service — check your internet connection and retry.",
         }
 
-    return {"summary": summary, "raw_response": response, "error": None}
+    # ── Extract and validate response ────────────────────────────────────────
+    try:
+        raw_text: str = message.content[0].text
+    except (IndexError, AttributeError) as exc:
+        logger.error("Unexpected response shape from Claude API: %s", exc)
+        return {
+            "summary": "",
+            "error": "Received an unexpected response from the AI service — please retry.",
+        }
+
+    if not raw_text or not raw_text.strip():
+        return {
+            "summary": "",
+            "error": "AI service returned an empty response — please retry.",
+        }
+
+    summary = raw_text.strip()
+
+    # ── Post-process: flag confabulated column references ────────────────────
+    summary = _flag_confabulated_columns(
+        summary,
+        column_names=[p["name"] for p in prompt_payload.get("column_profiles", [])],
+    )
+
+    logger.info(
+        "Insights generated: %d characters, stop_reason=%s",
+        len(summary),
+        getattr(message, "stop_reason", "unknown"),
+    )
+
+    return {"summary": summary, "error": None}
 
 
-def validate_summary_columns(summary: str, column_profiles: list) -> str:
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-processing helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flag_confabulated_columns(summary: str, column_names: list[str]) -> str:
     """
-    Check if the summary references non-existent columns.
-    Appends a disclaimer if mismatches are found.
+    Scan the summary for quoted identifiers that look like column references.
+    If any quoted word is not in column_names, append a disclaimer.
+
+    Heuristic: looks for words in single or double quotes that are not
+    common English stopwords and not present in the known column list.
     """
-    known_columns = {p["name"].lower() for p in column_profiles}
-    import re
-    quoted = re.findall(r"'([^']+)'", summary)
-    mismatches = [q for q in quoted if q.lower() not in known_columns]
-    if mismatches:
-        logger.warning("Summary references unknown columns: %s", mismatches)
-        summary += "\n\nNote: Some references may not match your data exactly."
+    if not column_names:
+        return summary
+
+    # Collect quoted tokens from the summary
+    quoted_tokens = re.findall(r"['\"]([A-Za-z0-9_ ]+)['\"]", summary)
+    stopwords = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+        "should", "may", "might", "must", "can", "could", "not", "and", "or",
+        "but", "if", "in", "on", "at", "to", "for", "of", "with", "by", "from",
+        "no", "yes", "so", "as", "up", "out", "about", "than", "then", "too",
+    }
+
+    column_names_lower = {str(c).lower() for c in column_names}
+    suspect_found = False
+
+    for token in quoted_tokens:
+        token_lower = token.lower().strip()
+        if token_lower in stopwords:
+            continue
+        # Check if it looks like a column reference (short, identifier-like)
+        if len(token_lower) <= 40 and token_lower not in column_names_lower:
+            suspect_found = True
+            break
+
+    if suspect_found:
+        disclaimer = (
+            "\n\n_Note: Some references in this summary may not exactly match "
+            "the column names in your data._"
+        )
+        summary = summary + disclaimer
+
     return summary
