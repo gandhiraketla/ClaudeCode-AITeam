@@ -1,238 +1,255 @@
+"""Travel search tools: flights and hotels via SerpApi."""
+from __future__ import annotations
 import os
-import json
 from datetime import datetime
-from serpapi import GoogleSearch
-import anthropic
+from typing import Any
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+SERPAPI_AVAILABLE = False
+try:
+    from serpapi import GoogleSearch
+    SERPAPI_AVAILABLE = True
+except ImportError:
+    pass
 
-AIRPORT_MAP = {
+REQUIRED_FLIGHT_KEYS = {"airline", "departure_time", "arrival_time", "price"}
+REQUIRED_HOTEL_KEYS = {"name", "price"}
+
+# IATA city-to-code mapping for common ambiguous cities
+CITY_TO_IATA: dict[str, str] = {
     "new york": "JFK", "ny": "JFK", "nyc": "JFK",
     "los angeles": "LAX", "la": "LAX",
-    "london": "LHR", "paris": "CDG",
-    "chicago": "ORD", "dallas": "DFW", "dfw": "DFW",
-    "miami": "MIA", "san francisco": "SFO",
-    "tokyo": "NRT", "dubai": "DXB",
-    "rome": "FCO", "barcelona": "BCN",
-    "amsterdam": "AMS", "frankfurt": "FRA",
-    "sydney": "SYD", "toronto": "YYZ",
+    "chicago": "ORD",
+    "london": "LHR",
+    "paris": "CDG",
+    "tokyo": "NRT",
+    "dubai": "DXB",
+    "sydney": "SYD",
+    "dallas": "DFW", "dfw": "DFW",
+    "miami": "MIA",
+    "san francisco": "SFO", "sf": "SFO",
+    "boston": "BOS",
+    "seattle": "SEA",
+    "denver": "DEN",
+    "atlanta": "ATL",
+    "frankfurt": "FRA",
+    "amsterdam": "AMS",
+    "singapore": "SIN",
+    "toronto": "YYZ",
+    "vancouver": "YVR",
+    "rome": "FCO",
+    "barcelona": "BCN",
+    "madrid": "MAD",
 }
 
 
-def resolve_iata(city: str) -> str:
-    if not city:
+def resolve_iata(city_or_code: str) -> str:
+    """Resolve city name or IATA code to uppercase IATA code."""
+    if not city_or_code:
         return ""
-    if len(city) == 3 and city.isupper():
-        return city
-    return AIRPORT_MAP.get(city.lower().strip(), city.upper()[:3])
+    normalized = city_or_code.strip().lower()
+    if normalized in CITY_TO_IATA:
+        return CITY_TO_IATA[normalized]
+    # Assume it's already an IATA code
+    return city_or_code.strip().upper()
 
 
-def extract_intent_and_slots(messages: list, current_user_message: str) -> dict:
-    recent = messages[-10:] if len(messages) > 10 else messages
-    conversation = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
-    prompt = f"""Analyze this travel conversation and extract intent and slots.
+def _get_api_key() -> str:
+    key = os.environ.get("SERPAPI_API_KEY", "")
+    return key
 
-Conversation:\n{conversation}\nCurrent message: {current_user_message}
 
-Return ONLY valid JSON:
-{{
-  "intent": "full_itinerary|flights_only|hotels_only|unclear",
-  "slots": {{
-    "origin": null,
-    "destination": null,
-    "departure_date": null,
-    "return_date": null,
-    "check_in_date": null,
-    "check_out_date": null,
-    "num_travelers": null,
-    "budget_usd": null,
-    "interests": null
-  }},
-  "missing_required": []
-}}
-
-For full_itinerary: required = origin, destination, departure_date, check_in_date, check_out_date.
-For flights_only: required = origin, destination, departure_date.
-For hotels_only: required = destination, check_in_date, check_out_date.
-Dates must be ISO8601 (YYYY-MM-DD). If year not specified assume 2025.
-Only include fields in missing_required if truly absent."""
+def _validate_flight_result(raw: dict) -> dict | None:
+    """Validate and normalize a single flight result dict. Returns None if invalid."""
     try:
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = response.content[0].text.strip()
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception as e:
-        return {"intent": "unclear", "slots": {}, "missing_required": [], "error": str(e)}
+        airline = raw.get("airline") or raw.get("flights", [{}])[0].get("airline", "Unknown")
+        departure = raw.get("departure_airport", {}).get("time") or raw.get("departure_time", "")
+        arrival = raw.get("arrival_airport", {}).get("time") or raw.get("arrival_time", "")
+        price = raw.get("price", 0)
+        if not isinstance(price, (int, float)):
+            try:
+                price = float(str(price).replace("$", "").replace(",", ""))
+            except (ValueError, TypeError):
+                price = 0
+        flight_number = ""
+        if raw.get("flights"):
+            first = raw["flights"][0]
+            flight_number = first.get("flight_number", "")
+            if not airline or airline == "Unknown":
+                airline = first.get("airline", "Unknown")
+            if not departure:
+                departure = first.get("departure_airport", {}).get("time", "")
+            if not arrival:
+                arrival = first.get("arrival_airport", {}).get("time", "")
+        return {
+            "airline": str(airline)[:100],
+            "flight_number": str(flight_number)[:20],
+            "departure_time": str(departure)[:50],
+            "arrival_time": str(arrival)[:50],
+            "duration_minutes": int(raw.get("total_duration", 0)),
+            "price_usd": float(price),
+            "stops": int(raw.get("layovers", 0)) if isinstance(raw.get("layovers"), int)
+                      else len(raw.get("layovers", [])),
+            "booking_url": None,
+        }
+    except Exception:
+        return None
 
 
-def generate_clarification_question(intent: str, confirmed_slots: dict, missing_required: list) -> dict:
-    if not missing_required:
-        return {"question": "", "slot_being_asked": ""}
-    slot = missing_required[0]
-    slot_prompts = {
-        "origin": "Where will you be departing from?",
-        "destination": "Where would you like to travel to?",
-        "departure_date": "What date are you planning to depart? (e.g., 2025-06-15)",
-        "return_date": "What date will you be returning?",
-        "check_in_date": "What date would you like to check in to your hotel?",
-        "check_out_date": "What date will you be checking out of your hotel?",
-        "num_travelers": "How many travelers will be going?",
-        "budget_usd": "Do you have a budget in mind (USD)?",
-        "interests": "What are your interests or preferences for activities?",
-    }
-    question = slot_prompts.get(slot, f"Could you please provide your {slot.replace('_', ' ')}?")
-    return {"question": question, "slot_being_asked": slot}
+def _validate_hotel_result(raw: dict) -> dict | None:
+    """Validate and normalize a single hotel result dict. Returns None if invalid."""
+    try:
+        name = raw.get("name", "")
+        if not name:
+            return None
+        price_per_night = raw.get("rate_per_night", {}).get("lowest") or raw.get("price", 0)
+        if not isinstance(price_per_night, (int, float)):
+            try:
+                price_per_night = float(str(price_per_night).replace("$", "").replace(",", ""))
+            except (ValueError, TypeError):
+                price_per_night = 0
+        total = raw.get("total_rate", {}).get("lowest") or raw.get("total_price", price_per_night)
+        if not isinstance(total, (int, float)):
+            try:
+                total = float(str(total).replace("$", "").replace(",", ""))
+            except (ValueError, TypeError):
+                total = price_per_night
+        amenities = raw.get("amenities", [])
+        if not isinstance(amenities, list):
+            amenities = []
+        amenities = [str(a)[:80] for a in amenities[:10]]
+        return {
+            "name": str(name)[:150],
+            "star_rating": float(raw.get("overall_rating", raw.get("star_rating", 0)) or 0),
+            "price_per_night_usd": float(price_per_night),
+            "total_price_usd": float(total),
+            "address": str(raw.get("address", ""))[:200],
+            "amenities": amenities,
+            "booking_url": None,
+        }
+    except Exception:
+        return None
 
 
-def search_flights(origin_iata: str, destination_iata: str, departure_date: str,
-                  return_date: str = None, num_travelers: int = 1, currency: str = "USD") -> dict:
+def search_flights(
+    origin_iata: str,
+    destination_iata: str,
+    departure_date: str,
+    return_date: str | None = None,
+    num_travelers: int = 1,
+    currency: str = "USD",
+) -> dict:
+    """Search real-time flights via SerpApi google_flights engine."""
     if not origin_iata or not destination_iata or not departure_date:
-        return {"flights": [], "error": "Missing required fields: origin, destination, or departure_date",
-                "search_timestamp": datetime.utcnow().isoformat()}
+        return {"flights": None, "search_timestamp": _now(), "error": "Missing required fields: origin, destination, or departure_date."}
+
     origin_iata = resolve_iata(origin_iata)
     destination_iata = resolve_iata(destination_iata)
+
+    if not SERPAPI_AVAILABLE:
+        return {"flights": None, "search_timestamp": _now(), "error": "SerpApi client not installed."}
+
+    api_key = _get_api_key()
+    if not api_key:
+        return {"flights": None, "search_timestamp": _now(), "error": "Flight search service unavailable."}
+
+    params: dict[str, Any] = {
+        "engine": "google_flights",
+        "departure_id": origin_iata,
+        "arrival_id": destination_iata,
+        "outbound_date": departure_date,
+        "adults": num_travelers,
+        "currency": currency,
+        "hl": "en",
+        "api_key": api_key,
+    }
+    if return_date:
+        params["return_date"] = return_date
+        params["type"] = "1"  # round trip
+    else:
+        params["type"] = "2"  # one way
+
     try:
-        params = {
-            "engine": "google_flights",
-            "departure_id": origin_iata,
-            "arrival_id": destination_iata,
-            "outbound_date": departure_date,
-            "currency": currency,
-            "hl": "en",
-            "api_key": os.getenv("SERPAPI_API_KEY"),
-        }
-        if return_date:
-            params["return_date"] = return_date
-            params["type"] = "1"
-        else:
-            params["type"] = "2"
         search = GoogleSearch(params)
         results = search.get_dict()
-        flights = []
-        for section in ["best_flights", "other_flights"]:
-            for item in results.get(section, []):
-                legs = item.get("flights", [])
-                if not legs:
-                    continue
-                first = legs[0]
-                flights.append({
-                    "airline": first.get("airline", "Unknown"),
-                    "flight_number": first.get("flight_number", "N/A"),
-                    "departure_time": first.get("departure_airport", {}).get("time", ""),
-                    "arrival_time": legs[-1].get("arrival_airport", {}).get("time", ""),
-                    "duration_minutes": item.get("total_duration", 0),
-                    "price_usd": item.get("price", 0),
-                    "stops": len(legs) - 1,
-                    "booking_url": ""
-                })
-            if len(flights) >= 5:
-                break
-        return {"flights": flights[:5], "search_timestamp": datetime.utcnow().isoformat()}
-    except Exception as e:
-        return {"flights": [], "error": "Flight search unavailable. Please try again later.",
-                "search_timestamp": datetime.utcnow().isoformat()}
+    except Exception:
+        return {"flights": None, "search_timestamp": _now(), "error": "Flight search service is temporarily unavailable."}
+
+    if "error" in results:
+        return {"flights": None, "search_timestamp": _now(), "error": "Flight search returned no results for this route and date."}
+
+    raw_flights = results.get("best_flights", []) + results.get("other_flights", [])
+    flights = []
+    for rf in raw_flights[:10]:
+        validated = _validate_flight_result(rf)
+        if validated:
+            flights.append(validated)
+
+    return {
+        "flights": flights if flights else None,
+        "search_timestamp": _now(),
+        "error": None if flights else "No flights found for this route and date.",
+    }
 
 
-def search_hotels(destination: str, check_in_date: str, check_out_date: str,
-                 num_guests: int = 1, budget_usd_per_night: float = None) -> dict:
+def search_hotels(
+    destination: str,
+    check_in_date: str,
+    check_out_date: str,
+    num_guests: int = 1,
+    budget_usd_per_night: float | None = None,
+) -> dict:
+    """Search real-time hotels via SerpApi google_hotels engine."""
     if not destination or not check_in_date or not check_out_date:
-        return {"hotels": [], "error": "Missing required fields: destination, check_in_date, or check_out_date",
-                "search_timestamp": datetime.utcnow().isoformat()}
+        return {"hotels": None, "search_timestamp": _now(), "error": "Missing required fields: destination, check_in_date, or check_out_date."}
+
+    if not SERPAPI_AVAILABLE:
+        return {"hotels": None, "search_timestamp": _now(), "error": "SerpApi client not installed."}
+
+    api_key = _get_api_key()
+    if not api_key:
+        return {"hotels": None, "search_timestamp": _now(), "error": "Hotel search service unavailable."}
+
+    params: dict[str, Any] = {
+        "engine": "google_hotels",
+        "q": f"hotels in {destination}",
+        "check_in_date": check_in_date,
+        "check_out_date": check_out_date,
+        "adults": num_guests,
+        "currency": "USD",
+        "hl": "en",
+        "api_key": api_key,
+    }
+
     try:
-        params = {
-            "engine": "google_hotels",
-            "q": f"hotels in {destination}",
-            "check_in_date": check_in_date,
-            "check_out_date": check_out_date,
-            "adults": str(num_guests),
-            "currency": "USD",
-            "hl": "en",
-            "api_key": os.getenv("SERPAPI_API_KEY"),
-        }
         search = GoogleSearch(params)
         results = search.get_dict()
-        hotels = []
-        for prop in results.get("properties", [])[:5]:
-            rate = prop.get("rate_per_night", {})
-            price_per_night = 0
-            if isinstance(rate, dict):
-                extracted = rate.get("extracted_lowest", rate.get("lowest", 0))
-                try:
-                    price_per_night = float(str(extracted).replace(",", "").replace("$", ""))
-                except (ValueError, TypeError):
-                    price_per_night = 0
+    except Exception:
+        return {"hotels": None, "search_timestamp": _now(), "error": "Hotel search service is temporarily unavailable."}
+
+    if "error" in results:
+        return {"hotels": None, "search_timestamp": _now(), "error": "Hotel search returned no results for this destination and dates."}
+
+    raw_hotels = results.get("properties", [])
+    hotels = []
+    for rh in raw_hotels[:10]:
+        if budget_usd_per_night:
+            price_raw = rh.get("rate_per_night", {}).get("lowest", 0)
             try:
-                from datetime import date
-                ci = date.fromisoformat(check_in_date)
-                co = date.fromisoformat(check_out_date)
-                nights = max((co - ci).days, 1)
-            except Exception:
-                nights = 1
-            hotels.append({
-                "name": prop.get("name", "Unknown Hotel"),
-                "star_rating": prop.get("overall_rating", 0),
-                "price_per_night_usd": price_per_night,
-                "total_price_usd": round(price_per_night * nights, 2),
-                "address": prop.get("description", destination),
-                "amenities": prop.get("amenities", [])[:5],
-                "booking_url": prop.get("link", "")
-            })
-        return {"hotels": hotels, "search_timestamp": datetime.utcnow().isoformat()}
-    except Exception as e:
-        return {"hotels": [], "error": "Hotel search unavailable. Please try again later.",
-                "search_timestamp": datetime.utcnow().isoformat()}
+                price_val = float(str(price_raw).replace("$", "").replace(",", ""))
+                if price_val > budget_usd_per_night * 1.2:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        validated = _validate_hotel_result(rh)
+        if validated:
+            hotels.append(validated)
+
+    return {
+        "hotels": hotels if hotels else None,
+        "search_timestamp": _now(),
+        "error": None if hotels else "No hotels found for this destination and dates.",
+    }
 
 
-def compose_itinerary(slots: dict, flights: list, hotels: list, intent: str) -> dict:
-    if not flights and not hotels:
-        return {"itinerary_markdown": "", "days": 0,
-                "warnings": ["No live flight or hotel data was available to compose an itinerary."]}
-    warnings = []
-    flights_text = json.dumps(flights, indent=2) if flights else "No flight data available."
-    hotels_text = json.dumps(hotels, indent=2) if hotels else "No hotel data available."
-    if not flights:
-        warnings.append("No live flight data was found for this route and date.")
-    if not hotels:
-        warnings.append("No live hotel data was found for this destination and dates.")
-    prompt = f"""You are a travel planning assistant. Compose a structured day-by-day itinerary.
-
-IMPORTANT RULES:
-- Use ONLY the flight and hotel data provided below. Do NOT invent prices, times, or hotel names.
-- If fewer than 2 hotels are available, state that clearly instead of padding with invented options.
-- Format: Day headers (Day 1: YYYY-MM-DD), sub-sections for Flights, Accommodation, Activities.
-- Include price and time for every flight and hotel entry.
-- Do not offer to book anything.
-
-Trip details: {json.dumps(slots, indent=2)}
-Intent: {intent}
-
-Flight options:\n{flights_text}
-
-Hotel options:\n{hotels_text}
-
-Compose the itinerary now in markdown:"""
-    try:
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        itinerary = response.content[0].text.strip()
-        try:
-            check_in = slots.get("check_in_date") or slots.get("departure_date", "")
-            check_out = slots.get("check_out_date") or slots.get("return_date", "")
-            if check_in and check_out:
-                from datetime import date
-                days = max((date.fromisoformat(check_out) - date.fromisoformat(check_in)).days, 1)
-            else:
-                days = 1
-        except Exception:
-            days = 1
-        return {"itinerary_markdown": itinerary, "days": days, "warnings": warnings}
-    except Exception as e:
-        return {"itinerary_markdown": "", "days": 0, "warnings": ["Failed to compose itinerary. Please try again."]}
+def _now() -> str:
+    return datetime.utcnow().isoformat() + "Z"

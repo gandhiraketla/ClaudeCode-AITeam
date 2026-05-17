@@ -3,9 +3,10 @@
 ## Files Created
 - requirements.txt
 - .env.example
-- app.py
-- src/agent.py
-- src/tools.py
+- .streamlit/config.toml
 - src/state.py
+- src/tools.py
 - src/prompts.py
+- src/agent.py
+- app.py
 - demo.py

@@ -1,53 +1,67 @@
-#!/usr/bin/env python3
-"""
-demo.py — Standalone demo for the Travel Itinerary Agent.
-Runs a simulated multi-turn conversation and prints the final itinerary.
-"""
-
+"""Demo script for the Travel Itinerary Agent — runs without user interaction."""
+from __future__ import annotations
 import os
 import sys
 from dotenv import load_dotenv
 
 load_dotenv()
 
-print("=" * 60)
-print("TRAVEL ITINERARY AGENT — DEMO")
-print("=" * 60)
-print("Agent: AI-powered travel planner that searches real-time")
-print("       flights and hotels and composes a day-by-day itinerary.")
-print("=" * 60)
+# Minimal stub for st.session_state so agent works outside Streamlit
+class _SessionState(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+    def __setattr__(self, name, value):
+        self[name] = value
 
-SAMPLE_INPUT = "Plan my trip to Paris from New York for 5 days starting June 15 for 2 people, budget around $3000"
-print(f"\nSample Input: {SAMPLE_INPUT}")
-print("-" * 60)
+import streamlit as st
+st.session_state = _SessionState()
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from src.state import init_state
+from src.agent import process_message
 
-try:
-    from src.agent import TravelAgent
-except ImportError as e:
-    print(f"[ERROR] Could not import TravelAgent: {e}")
-    print("Make sure you have run: pip install -r requirements.txt")
-    sys.exit(1)
+def run_demo():
+    init_state()
 
-# Check required env vars
-for var in ["ANTHROPIC_API_KEY", "SERPAPI_API_KEY"]:
-    if not os.getenv(var):
-        print(f"[WARNING] {var} not set in environment — API calls may fail.")
+    scenarios = [
+        {
+            "label": "Full itinerary request",
+            "message": "Plan my trip to Paris for 5 days starting June 10 2025, 2 travelers, flying from New York. Budget around $200/night for hotels.",
+        },
+        {
+            "label": "Flights-only query",
+            "message": "Show me flights from New York to Dallas on March 15 2025 for 1 person.",
+        },
+        {
+            "label": "Incomplete request (clarification expected)",
+            "message": "I want to visit Tokyo.",
+        },
+    ]
 
-agent = TravelAgent()
+    for scenario in scenarios:
+        print("=" * 70)
+        print(f"SCENARIO: {scenario['label']}")
+        print(f"USER: {scenario['message']}")
+        print("-" * 70)
 
-print("\n[AGENT RESPONSE]\n")
-try:
-    response = agent.chat(SAMPLE_INPUT)
-    print(response)
-except Exception as e:
-    print(f"[ERROR] Agent raised an exception: {e}")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+        # Reset state for each scenario
+        st.session_state.clear()
+        init_state()
 
-print("\n" + "=" * 60)
-print("Demo complete.")
-print("Run 'streamlit run app.py' to use the full chat interface.")
-print("=" * 60)
+        response = process_message(scenario["message"])
+        print(f"AGENT:\n{response}")
+        print()
+
+if __name__ == "__main__":
+    missing_keys = []
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        missing_keys.append("ANTHROPIC_API_KEY")
+    if not os.environ.get("SERPAPI_API_KEY"):
+        missing_keys.append("SERPAPI_API_KEY")
+    if missing_keys:
+        print(f"WARNING: Missing environment variables: {', '.join(missing_keys)}")
+        print("Add them to your .env file. Demo will run but API calls will fail gracefully.")
+        print()
+    run_demo()
